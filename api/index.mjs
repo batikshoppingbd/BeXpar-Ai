@@ -695,6 +695,261 @@ function rateLimit(maxRequests, windowMs) {
 }
 
 // server/services/courierService.ts
+function isMissingIsDefaultColumn(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  return msg.includes("is_default") && (msg.includes("does not exist") || msg.includes("schema cache") || msg.includes("column"));
+}
+async function getFallbackDefaultCourier(businessId) {
+  try {
+    const admin = getSupabaseAdmin();
+    const { data } = await admin.from("ai_settings").select("order_collection_rules").eq("business_id", businessId).maybeSingle();
+    const rules = data?.order_collection_rules && typeof data.order_collection_rules === "object" ? data.order_collection_rules : {};
+    const val = String(rules.default_courier || "");
+    return val === "steadfast" || val === "pathao" ? val : null;
+  } catch {
+    return null;
+  }
+}
+async function setFallbackDefaultCourier(businessId, provider) {
+  try {
+    const admin = getSupabaseAdmin();
+    const { data } = await admin.from("ai_settings").select("order_collection_rules").eq("business_id", businessId).maybeSingle();
+    if (!data) return;
+    const rules = data.order_collection_rules && typeof data.order_collection_rules === "object" ? data.order_collection_rules : {};
+    await admin.from("ai_settings").update({
+      order_collection_rules: {
+        ...rules,
+        default_courier: provider || ""
+      },
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("business_id", businessId);
+  } catch {
+  }
+}
+function toSafeCourierAccount(row, fallbackDefault) {
+  const provider = String(row.provider);
+  const isDefault = row.is_default !== void 0 ? Boolean(row.is_default) : fallbackDefault === provider;
+  return {
+    id: String(row.id),
+    provider,
+    label: String(row.label || provider.toUpperCase()),
+    client_id: String(row.client_id || ""),
+    username: String(row.username || ""),
+    store_id: String(row.store_id || ""),
+    is_sandbox: Boolean(row.is_sandbox),
+    is_active: Boolean(row.is_active),
+    is_default: isDefault,
+    updated_at: String(row.updated_at || ""),
+    has_api_key: Boolean(row.api_key_encrypted),
+    has_secret_key: Boolean(row.secret_key_encrypted),
+    has_client_secret: Boolean(row.client_secret_encrypted),
+    has_password: Boolean(row.password_encrypted)
+  };
+}
+async function getBusinessCourierOverview(businessId) {
+  const admin = getSupabaseAdmin();
+  let accountsData = [];
+  let usingFallbackDefault = false;
+  const accRes = await admin.from("courier_accounts").select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, is_default, updated_at").eq("business_id", businessId);
+  if (accRes.error && isMissingIsDefaultColumn(accRes.error)) {
+    usingFallbackDefault = true;
+    const legacyRes = await admin.from("courier_accounts").select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at").eq("business_id", businessId);
+    if (legacyRes.error) throw new Error(legacyRes.error.message);
+    accountsData = legacyRes.data || [];
+  } else if (accRes.error) {
+    throw new Error(accRes.error.message);
+  } else {
+    accountsData = accRes.data || [];
+  }
+  const { data: shipments, error: shipErr } = await admin.from("courier_shipments").select("*, events:courier_tracking_events(*)").eq("business_id", businessId).order("created_at", { ascending: false }).limit(50);
+  if (shipErr) throw new Error(shipErr.message);
+  const fallbackDefault = usingFallbackDefault ? await getFallbackDefaultCourier(businessId) : null;
+  const safeAccounts = accountsData.map((row) => toSafeCourierAccount(row, fallbackDefault));
+  const explicitDefault = safeAccounts.find((a) => a.is_default && a.is_active)?.provider || safeAccounts.find((a) => a.is_default)?.provider || safeAccounts.find((a) => a.is_active)?.provider || null;
+  return {
+    accounts: safeAccounts,
+    defaultProvider: explicitDefault,
+    shipments: shipments || []
+  };
+}
+async function saveBusinessCourierAccount(businessId, input) {
+  const admin = getSupabaseAdmin();
+  const prov = String(input.provider || "").trim();
+  if (prov !== "steadfast" && prov !== "pathao") {
+    throw new Error("Valid courier provider (steadfast or pathao) is required.");
+  }
+  const { data: existing } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", prov).maybeSingle();
+  const { data: allExisting } = await admin.from("courier_accounts").select("id, provider, is_active").eq("business_id", businessId);
+  if (prov === "steadfast") {
+    const hasKey = Boolean(String(input.api_key || "").trim() || existing?.api_key_encrypted);
+    const hasSec = Boolean(String(input.secret_key || "").trim() || existing?.secret_key_encrypted);
+    if (!hasKey || !hasSec) {
+      throw new Error("Steadfast API Key and Secret Key are required.");
+    }
+  } else {
+    const cid = input.client_id !== void 0 ? String(input.client_id || "").trim() : String(existing?.client_id || "");
+    const csec = Boolean(String(input.client_secret || "").trim() || existing?.client_secret_encrypted);
+    const user = input.username !== void 0 ? String(input.username || "").trim() : String(existing?.username || "");
+    const pass = Boolean(String(input.password || "").trim() || existing?.password_encrypted);
+    const store = input.store_id !== void 0 ? String(input.store_id || "").trim() : String(existing?.store_id || "");
+    if (!cid || !csec || !user || !pass || !store) {
+      throw new Error("Pathao Client ID, Client Secret, Username, Password, and Store ID are required.");
+    }
+  }
+  const nextActive = input.is_active !== void 0 ? Boolean(input.is_active) : existing ? Boolean(existing.is_active) : true;
+  const shouldBeDefault = input.is_default === true || !existing && (allExisting || []).length === 0 && nextActive;
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const basePayload = {
+    business_id: businessId,
+    provider: prov,
+    label: input.label ? String(input.label).trim() : prov === "steadfast" ? "Steadfast Courier" : "Pathao Courier",
+    is_sandbox: input.is_sandbox !== void 0 ? Boolean(input.is_sandbox) : Boolean(existing?.is_sandbox),
+    is_active: nextActive,
+    updated_at: nowIso
+  };
+  if (typeof input.api_key === "string" && input.api_key.trim()) {
+    basePayload.api_key_encrypted = encryptSecret(input.api_key.trim());
+  } else if (existing?.api_key_encrypted) {
+    basePayload.api_key_encrypted = existing.api_key_encrypted;
+  }
+  if (typeof input.secret_key === "string" && input.secret_key.trim()) {
+    basePayload.secret_key_encrypted = encryptSecret(input.secret_key.trim());
+  } else if (existing?.secret_key_encrypted) {
+    basePayload.secret_key_encrypted = existing.secret_key_encrypted;
+  }
+  if (input.client_id !== void 0) basePayload.client_id = String(input.client_id || "").trim();
+  else if (existing?.client_id) basePayload.client_id = existing.client_id;
+  if (typeof input.client_secret === "string" && input.client_secret.trim()) {
+    basePayload.client_secret_encrypted = encryptSecret(input.client_secret.trim());
+  } else if (existing?.client_secret_encrypted) {
+    basePayload.client_secret_encrypted = existing.client_secret_encrypted;
+  }
+  if (input.username !== void 0) basePayload.username = String(input.username || "").trim();
+  else if (existing?.username) basePayload.username = existing.username;
+  if (typeof input.password === "string" && input.password.trim()) {
+    basePayload.password_encrypted = encryptSecret(input.password.trim());
+  } else if (existing?.password_encrypted) {
+    basePayload.password_encrypted = existing.password_encrypted;
+  }
+  if (input.store_id !== void 0) basePayload.store_id = String(input.store_id || "").trim();
+  else if (existing?.store_id) basePayload.store_id = existing.store_id;
+  if (shouldBeDefault) {
+    await admin.from("courier_accounts").update({ is_default: false, updated_at: nowIso }).eq("business_id", businessId).neq("provider", prov);
+  }
+  const payloadWithDefault = {
+    ...basePayload,
+    ...input.is_default !== void 0 || shouldBeDefault ? { is_default: shouldBeDefault } : {}
+  };
+  let savedRow = null;
+  const upsertRes = await admin.from("courier_accounts").upsert(payloadWithDefault, { onConflict: "business_id,provider" }).select("*").single();
+  if (upsertRes.error && isMissingIsDefaultColumn(upsertRes.error)) {
+    const legacyUpsert = await admin.from("courier_accounts").upsert(basePayload, { onConflict: "business_id,provider" }).select("*").single();
+    if (legacyUpsert.error) throw new Error(legacyUpsert.error.message);
+    savedRow = legacyUpsert.data;
+    if (shouldBeDefault) await setFallbackDefaultCourier(businessId, prov);
+  } else if (upsertRes.error) {
+    throw new Error(upsertRes.error.message);
+  } else {
+    savedRow = upsertRes.data;
+    if (shouldBeDefault) await setFallbackDefaultCourier(businessId, prov);
+  }
+  const overview = await getBusinessCourierOverview(businessId);
+  const safe = overview.accounts.find((a) => a.provider === prov) || toSafeCourierAccount(savedRow);
+  return { account: safe, defaultProvider: overview.defaultProvider };
+}
+async function revealBusinessCourierCredentials(businessId, provider) {
+  const admin = getSupabaseAdmin();
+  const { data: account, error } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", provider).maybeSingle();
+  if (error || !account) {
+    throw new Error(`No saved ${provider} credentials found.`);
+  }
+  const fallbackDefault = account.is_default === void 0 ? await getFallbackDefaultCourier(businessId) : null;
+  const isDefault = account.is_default !== void 0 ? Boolean(account.is_default) : fallbackDefault === provider;
+  if (provider === "steadfast") {
+    return {
+      provider: "steadfast",
+      api_key: decryptSecret(String(account.api_key_encrypted || "")),
+      secret_key: decryptSecret(String(account.secret_key_encrypted || "")),
+      is_active: Boolean(account.is_active),
+      is_default: isDefault,
+      updated_at: String(account.updated_at || "")
+    };
+  }
+  return {
+    provider: "pathao",
+    client_id: String(account.client_id || ""),
+    client_secret: decryptSecret(String(account.client_secret_encrypted || "")),
+    username: String(account.username || ""),
+    password: decryptSecret(String(account.password_encrypted || "")),
+    store_id: String(account.store_id || ""),
+    is_sandbox: Boolean(account.is_sandbox),
+    is_active: Boolean(account.is_active),
+    is_default: isDefault,
+    updated_at: String(account.updated_at || "")
+  };
+}
+async function updateBusinessCourierState(businessId, provider, patch) {
+  const admin = getSupabaseAdmin();
+  const { data: existing, error } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", provider).maybeSingle();
+  if (error || !existing) {
+    throw new Error(`No ${provider} courier configuration found. Save API credentials first.`);
+  }
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const nextActive = patch.is_active !== void 0 ? Boolean(patch.is_active) : Boolean(existing.is_active);
+  if (patch.is_default === true && !nextActive) {
+    throw new Error("Activate this courier before setting it as Default Courier.");
+  }
+  const updatePayload = { updated_at: nowIso };
+  if (patch.is_active !== void 0) updatePayload.is_active = nextActive;
+  if (patch.is_default === true) {
+    await admin.from("courier_accounts").update({ is_default: false, updated_at: nowIso }).eq("business_id", businessId).neq("provider", provider);
+    updatePayload.is_default = true;
+  } else if (patch.is_default === false || patch.is_active === false && existing.is_default) {
+    updatePayload.is_default = false;
+  }
+  const updRes = await admin.from("courier_accounts").update(updatePayload).eq("id", existing.id).eq("business_id", businessId).select("*").single();
+  if (updRes.error && isMissingIsDefaultColumn(updRes.error)) {
+    const legacyPatch = { updated_at: nowIso };
+    if (patch.is_active !== void 0) legacyPatch.is_active = nextActive;
+    const legacyUpd = await admin.from("courier_accounts").update(legacyPatch).eq("id", existing.id).eq("business_id", businessId);
+    if (legacyUpd.error) throw new Error(legacyUpd.error.message);
+  } else if (updRes.error) {
+    throw new Error(updRes.error.message);
+  }
+  if (patch.is_default === true) {
+    await setFallbackDefaultCourier(businessId, provider);
+  } else if (patch.is_default === false || patch.is_active === false) {
+    const currentFallback = await getFallbackDefaultCourier(businessId);
+    if (currentFallback === provider) {
+      await setFallbackDefaultCourier(businessId, null);
+    }
+  }
+  const overview = await getBusinessCourierOverview(businessId);
+  const safe = overview.accounts.find((a) => a.provider === provider);
+  if (!safe) throw new Error("Courier account not found after update.");
+  return { account: safe, defaultProvider: overview.defaultProvider };
+}
+async function disconnectBusinessCourier(businessId, provider) {
+  const admin = getSupabaseAdmin();
+  const { data: existing } = await admin.from("courier_accounts").select("id").eq("business_id", businessId).eq("provider", provider).maybeSingle();
+  if (!existing) {
+    throw new Error(`${provider} courier is not connected.`);
+  }
+  const { error } = await admin.from("courier_accounts").delete().eq("id", existing.id).eq("business_id", businessId);
+  if (error) throw new Error(error.message);
+  const fallback = await getFallbackDefaultCourier(businessId);
+  if (fallback === provider) {
+    await setFallbackDefaultCourier(businessId, null);
+  }
+  const overview = await getBusinessCourierOverview(businessId);
+  if (!overview.accounts.some((a) => a.is_default) && overview.accounts.some((a) => a.is_active)) {
+    const promote = overview.accounts.find((a) => a.is_active);
+    await updateBusinessCourierState(businessId, promote.provider, { is_default: true }).catch(() => {
+    });
+  }
+  const updated = await getBusinessCourierOverview(businessId);
+  return { disconnected: provider, defaultProvider: updated.defaultProvider };
+}
 function normalizeBdPhone(phone) {
   const digits = String(phone || "").replace(/[^\d]/g, "");
   if (digits.startsWith("8801") && digits.length === 13) {
@@ -790,15 +1045,26 @@ async function checkSteadfastFraudByPhone(businessId, phone) {
 }
 async function bookCourierParcel(params) {
   const admin = getSupabaseAdmin();
-  const { data: account, error: accErr } = await admin.from("courier_accounts").select("*").eq("business_id", params.businessId).eq("provider", params.provider).eq("is_active", true).maybeSingle();
+  let targetProvider = params.provider;
+  if (!targetProvider) {
+    const overview = await getBusinessCourierOverview(params.businessId);
+    targetProvider = overview.defaultProvider || void 0;
+  }
+  if (!targetProvider) {
+    throw new Error("No active courier account configured. Please connect Steadfast or Pathao in Courier Settings.");
+  }
+  const { data: account, error: accErr } = await admin.from("courier_accounts").select("*").eq("business_id", params.businessId).eq("provider", targetProvider).maybeSingle();
   if (accErr || !account) {
-    throw new Error(`No active ${params.provider} courier account configured. Please configure credentials in Courier Settings.`);
+    throw new Error(`No ${targetProvider} courier account configured. Please configure credentials in Courier Settings.`);
+  }
+  if (!account.is_active) {
+    throw new Error(`${targetProvider.toUpperCase()} courier is currently inactive. Activate it in Courier Settings or choose another courier.`);
   }
   let trackingId = "";
   let consignmentId = "";
   let parcelStatus = "created";
   let rawResponse = {};
-  if (params.provider === "steadfast") {
+  if (targetProvider === "steadfast") {
     const apiKey = decryptSecret(account.api_key_encrypted || "");
     const secretKey = decryptSecret(account.secret_key_encrypted || "");
     if (!apiKey || !secretKey) {
@@ -831,7 +1097,7 @@ async function bookCourierParcel(params) {
     trackingId = String(data.consignment.tracking_code || consignmentId);
     parcelStatus = data.consignment.status || "in_review";
     rawResponse = data;
-  } else if (params.provider === "pathao") {
+  } else if (targetProvider === "pathao") {
     const clientId = account.client_id || "";
     const clientSecret = decryptSecret(account.client_secret_encrypted || "");
     const username = account.username || "";
@@ -892,7 +1158,7 @@ async function bookCourierParcel(params) {
     business_id: params.businessId,
     order_id: params.orderId,
     courier_account_id: account.id,
-    provider: params.provider,
+    provider: targetProvider,
     tracking_id: trackingId,
     consignment_id: consignmentId,
     parcel_status: parcelStatus,
@@ -900,24 +1166,24 @@ async function bookCourierParcel(params) {
     raw_response: rawResponse
   }).select("*").single();
   if (shipErr) {
-    throw new Error(`Booked on ${params.provider} (Parcel ID: ${consignmentId || trackingId}) but failed to save shipment: ${shipErr.message}`);
+    throw new Error(`Booked on ${targetProvider} (Parcel ID: ${consignmentId || trackingId}) but failed to save shipment: ${shipErr.message}`);
   }
   if (shipment) {
     await admin.from("courier_tracking_events").insert({
       business_id: params.businessId,
       shipment_id: shipment.id,
       status: parcelStatus,
-      description: `Booked parcel via ${params.provider.toUpperCase()} (Parcel ID: ${consignmentId || trackingId})`,
+      description: `Booked parcel via ${targetProvider.toUpperCase()} (Parcel ID: ${consignmentId || trackingId})`,
       raw_payload: rawResponse
     });
   }
   await admin.from("orders").update({
-    courier_name: params.provider,
+    courier_name: targetProvider,
     tracking_id: trackingId,
     order_status: "shipped",
     updated_at: (/* @__PURE__ */ new Date()).toISOString()
   }).eq("id", params.orderId).eq("business_id", params.businessId);
-  return { trackingId, consignmentId, status: parcelStatus, shipment, raw: rawResponse };
+  return { trackingId, consignmentId, status: parcelStatus, provider: targetProvider, shipment, raw: rawResponse };
 }
 async function refreshCourierTracking(businessId, shipmentId) {
   const admin = getSupabaseAdmin();
@@ -3431,6 +3697,535 @@ var inboxAndAiRoutes_default = router3;
 
 // server/routes/integrationsAndBillingRoutes.ts
 import { Router as Router4 } from "express";
+
+// server/services/manualPaymentService.ts
+import crypto5 from "crypto";
+var ManualPaymentError = class extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+};
+var ALLOWED_GATEWAY_TYPES = /* @__PURE__ */ new Set(["manual", "bkash", "nagad", "rocket", "sslcommerz", "custom"]);
+var GATEWAY_SLUG_REGEX = /^[a-z0-9][a-z0-9_-]{1,48}$/;
+var BKASH_MAX_NUMBERS = 9;
+var MULTI_MFS_MAX_NUMBERS = 50;
+function resolveEffectiveGatewayType(row) {
+  const cfg = row.config_public && typeof row.config_public === "object" ? row.config_public : {};
+  const explicitMethod = typeof cfg.manual_method === "string" ? cfg.manual_method.trim().toLowerCase() : "";
+  const slug = String(row.slug || "").trim().toLowerCase();
+  const rawType = String(row.gateway_type || "manual").trim().toLowerCase();
+  if (explicitMethod === "rocket" || slug === "rocket" && rawType === "manual") {
+    return "rocket";
+  }
+  return rawType;
+}
+function normalizePaymentNumber(raw) {
+  return String(raw || "").replace(/[\s()-]+/g, "").trim();
+}
+function normalizeTransactionId(raw) {
+  return String(raw || "").trim().toUpperCase();
+}
+function parseAccountsFromConfigPublic(configPublic) {
+  if (!configPublic || typeof configPublic !== "object" || Array.isArray(configPublic)) {
+    return [];
+  }
+  const obj = configPublic;
+  if (Array.isArray(obj.accounts)) {
+    return obj.accounts.filter((item) => Boolean(item && typeof item === "object")).map((item, idx) => ({
+      id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : `acc_${idx + 1}`,
+      number: normalizePaymentNumber(String(item.number || "")),
+      account_type: typeof item.account_type === "string" && item.account_type.trim() ? item.account_type.trim().slice(0, 40) : "Personal",
+      label: typeof item.label === "string" ? item.label.trim().slice(0, 80) : "",
+      instructions: typeof item.instructions === "string" ? item.instructions.trim().slice(0, 400) : "",
+      is_active: item.is_active !== false
+    })).filter((acc) => Boolean(acc.number));
+  }
+  const legacyNumber = typeof obj.account_number === "string" ? normalizePaymentNumber(obj.account_number) : "";
+  if (legacyNumber) {
+    return [
+      {
+        id: "primary",
+        number: legacyNumber,
+        account_type: typeof obj.account_type === "string" && obj.account_type.trim() ? obj.account_type.trim().slice(0, 40) : "Personal",
+        label: typeof obj.display_note === "string" ? obj.display_note.trim().slice(0, 80) : "",
+        instructions: "",
+        is_active: true
+      }
+    ];
+  }
+  return [];
+}
+function validateAndNormalizeAccounts(gatewayTypeOrSlug, rawAccounts) {
+  const normalizedType = gatewayTypeOrSlug.trim().toLowerCase();
+  const isBkash = normalizedType === "bkash";
+  const maxAllowed = isBkash ? BKASH_MAX_NUMBERS : MULTI_MFS_MAX_NUMBERS;
+  if (rawAccounts.length > maxAllowed) {
+    throw new ManualPaymentError(
+      400,
+      isBkash ? `bKash supports a maximum of ${BKASH_MAX_NUMBERS} payment numbers.` : `Maximum ${MULTI_MFS_MAX_NUMBERS} numbers allowed per method.`
+    );
+  }
+  const seenDigits = /* @__PURE__ */ new Set();
+  const cleaned = [];
+  for (const item of rawAccounts) {
+    if (!item || typeof item !== "object") {
+      throw new ManualPaymentError(400, "Invalid payment number entry.");
+    }
+    const obj = item;
+    const number = normalizePaymentNumber(String(obj.number || ""));
+    const digits = number.replace(/[^\d]/g, "");
+    if (!/^\+?[0-9]+$/.test(number) || digits.length < 10 || digits.length > 15) {
+      throw new ManualPaymentError(400, `Invalid payment number "${String(obj.number || "")}". Enter a valid 10\u201315 digit number.`);
+    }
+    if (seenDigits.has(digits)) {
+      throw new ManualPaymentError(400, `Duplicate payment number "${number}" in the same payment method.`);
+    }
+    seenDigits.add(digits);
+    cleaned.push({
+      id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim().slice(0, 64) : crypto5.randomUUID().slice(0, 12),
+      number,
+      account_type: typeof obj.account_type === "string" && obj.account_type.trim() ? obj.account_type.trim().slice(0, 40) : "Personal",
+      label: typeof obj.label === "string" ? obj.label.trim().slice(0, 80) : "",
+      instructions: typeof obj.instructions === "string" ? obj.instructions.trim().slice(0, 400) : "",
+      is_active: obj.is_active !== false
+    });
+  }
+  return cleaned;
+}
+function sanitizeGatewayConfigPublic(raw, gatewayTypeOrSlug = "manual") {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const obj = raw;
+  const safe = {};
+  const allowedStringKeys = ["account_number", "account_type", "merchant_id", "bank_name", "routing_number", "display_note", "manual_method"];
+  for (const key of allowedStringKeys) {
+    if (typeof obj[key] === "string" && obj[key].trim()) {
+      safe[key] = obj[key].trim().slice(0, 200);
+    }
+  }
+  if (Array.isArray(obj.accounts)) {
+    const cleanedAccounts = validateAndNormalizeAccounts(gatewayTypeOrSlug, obj.accounts);
+    safe.accounts = cleanedAccounts;
+    const primary = cleanedAccounts.find((a) => a.is_active) || cleanedAccounts[0];
+    if (primary) {
+      safe.account_number = primary.number;
+      safe.account_type = primary.account_type;
+    } else {
+      delete safe.account_number;
+      delete safe.account_type;
+    }
+  } else if (typeof safe.account_number === "string") {
+    safe.accounts = [
+      {
+        id: "primary",
+        number: normalizePaymentNumber(safe.account_number),
+        account_type: typeof safe.account_type === "string" ? safe.account_type : "Personal",
+        label: "",
+        instructions: "",
+        is_active: true
+      }
+    ];
+  }
+  return safe;
+}
+function sanitizeGatewayCredentials(raw) {
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return trimmed ? { api_token: trimmed } : null;
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw;
+  const cleaned = {};
+  const allowedCredKeys = ["merchant_id", "api_key", "api_secret", "username", "password", "webhook_secret"];
+  for (const key of allowedCredKeys) {
+    if (typeof obj[key] === "string" && obj[key].trim()) {
+      cleaned[key] = obj[key].trim();
+    }
+  }
+  return Object.keys(cleaned).length > 0 ? cleaned : null;
+}
+function toSafeGatewayRow(row) {
+  const { credentials_encrypted, ...rest } = row;
+  const effectiveType = resolveEffectiveGatewayType(row);
+  const accounts = parseAccountsFromConfigPublic(row.config_public);
+  return {
+    ...rest,
+    gateway_type: effectiveType,
+    accounts,
+    active_accounts: accounts.filter((a) => a.is_active),
+    max_numbers: effectiveType === "bkash" ? BKASH_MAX_NUMBERS : MULTI_MFS_MAX_NUMBERS,
+    has_credentials: Boolean(typeof credentials_encrypted === "string" && credentials_encrypted.trim().length > 0)
+  };
+}
+async function listActiveCatalogGateways() {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin.from("payment_gateways").select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, instructions, updated_at").eq("is_active", true).order("slug");
+  if (error) throw new ManualPaymentError(500, error.message);
+  return (data || []).map((row) => {
+    const record = row;
+    const effectiveType = resolveEffectiveGatewayType(record);
+    const allAccounts = parseAccountsFromConfigPublic(record.config_public);
+    const activeAccounts = allAccounts.filter((a) => a.is_active);
+    return {
+      ...record,
+      gateway_type: effectiveType,
+      config_public: {
+        ...record.config_public && typeof record.config_public === "object" ? record.config_public : {},
+        accounts: activeAccounts
+      },
+      active_accounts: activeAccounts
+    };
+  });
+}
+async function upsertManualGatewayAccounts(slugOrMethod, params, actor) {
+  const admin = getSupabaseAdmin();
+  const { data: existing } = await admin.from("payment_gateways").select("*").eq("slug", slugOrMethod).maybeSingle();
+  const existingCfg = existing?.config_public && typeof existing.config_public === "object" ? existing.config_public : {};
+  const nextConfigPublic = sanitizeGatewayConfigPublic(
+    {
+      ...existingCfg,
+      manual_method: slugOrMethod,
+      ...params.accounts !== void 0 ? { accounts: params.accounts } : {}
+    },
+    slugOrMethod
+  );
+  const defaults = {
+    bkash: {
+      name: "bKash",
+      instructions: "Open bKash app -> Send Money to any active number below -> Copy TrxID and submit here."
+    },
+    nagad: {
+      name: "Nagad",
+      instructions: "Open Nagad app -> Send Money to any active number below -> Copy TrxID and submit here."
+    },
+    rocket: {
+      name: "Rocket",
+      instructions: "Open Rocket app -> Send Money to any active number below -> Copy TrxID and submit here."
+    }
+  };
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  if (!existing) {
+    const insertPayload = {
+      slug: slugOrMethod,
+      name: params.name?.trim() || defaults[slugOrMethod].name,
+      gateway_type: slugOrMethod,
+      is_active: params.is_active !== void 0 ? params.is_active : true,
+      is_sandbox: false,
+      config_public: nextConfigPublic,
+      credentials_encrypted: "",
+      instructions: typeof params.instructions === "string" ? params.instructions.trim().slice(0, 1e3) : defaults[slugOrMethod].instructions,
+      updated_at: nowIso
+    };
+    let created = await admin.from("payment_gateways").insert(insertPayload).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    if (created.error && created.error.message.toLowerCase().includes("gateway_type")) {
+      created = await admin.from("payment_gateways").insert({ ...insertPayload, gateway_type: "manual" }).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    }
+    if (created.error) throw new ManualPaymentError(400, created.error.message);
+    await writeAuditLog({
+      actorId: actor.id,
+      actorEmail: actor.email,
+      actorRole: actor.role,
+      action: "manual_payment_method_created",
+      targetType: "payment_gateway",
+      targetId: slugOrMethod,
+      details: { count: parseAccountsFromConfigPublic(nextConfigPublic).length, is_active: insertPayload.is_active },
+      ipAddress: actor.ip
+    });
+    return toSafeGatewayRow(created.data);
+  }
+  const updatePayload = {
+    config_public: nextConfigPublic,
+    is_sandbox: false,
+    updated_at: nowIso
+  };
+  if (typeof params.is_active === "boolean") updatePayload.is_active = params.is_active;
+  if (typeof params.instructions === "string") updatePayload.instructions = params.instructions.trim().slice(0, 1e3);
+  if (typeof params.name === "string" && params.name.trim()) updatePayload.name = params.name.trim().slice(0, 100);
+  const { data: updated, error } = await admin.from("payment_gateways").update(updatePayload).eq("slug", slugOrMethod).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+  if (error) throw new ManualPaymentError(400, error.message);
+  await writeAuditLog({
+    actorId: actor.id,
+    actorEmail: actor.email,
+    actorRole: actor.role,
+    action: "manual_payment_method_updated",
+    targetType: "payment_gateway",
+    targetId: slugOrMethod,
+    details: {
+      count: parseAccountsFromConfigPublic(nextConfigPublic).length,
+      is_active: updated.is_active
+    },
+    ipAddress: actor.ip
+  });
+  return toSafeGatewayRow(updated);
+}
+async function submitManualPayment(params) {
+  const admin = getSupabaseAdmin();
+  const slug = String(params.gateway_slug || "").trim().toLowerCase();
+  const trxId = normalizeTransactionId(params.transaction_id || "");
+  const senderNumber = normalizePaymentNumber(params.sender_number || "");
+  let paidToNumber = normalizePaymentNumber(params.paid_to_number || "");
+  if (!slug || !params.payment_for || !params.reference_id || !trxId) {
+    throw new ManualPaymentError(400, "Payment method, package/plan, and Transaction ID are required.");
+  }
+  if (!["coin_package", "subscription"].includes(params.payment_for)) {
+    throw new ManualPaymentError(400, "Invalid payment target type.");
+  }
+  if (trxId.length < 5 || trxId.length > 80 || !/^[A-Z0-9_-]+$/.test(trxId)) {
+    throw new ManualPaymentError(400, "Please enter a valid Transaction ID (5\u201380 alphanumeric characters).");
+  }
+  const senderDigits = senderNumber.replace(/[^\d]/g, "");
+  if (!senderNumber || senderDigits.length < 8 || senderDigits.length > 15) {
+    throw new ManualPaymentError(400, "Please enter a valid sender mobile/account number.");
+  }
+  const { data: gateway } = await admin.from("payment_gateways").select("*").eq("slug", slug).maybeSingle();
+  if (!gateway || !gateway.is_active) {
+    throw new ManualPaymentError(400, "Selected payment method is unavailable or inactive.");
+  }
+  const accounts = parseAccountsFromConfigPublic(gateway.config_public);
+  const activeAccounts = accounts.filter((a) => a.is_active);
+  if (accounts.length > 0 && activeAccounts.length === 0) {
+    throw new ManualPaymentError(400, "No active receiving payment numbers are currently configured for this method.");
+  }
+  if (activeAccounts.length > 0) {
+    if (!paidToNumber) {
+      paidToNumber = activeAccounts[0].number;
+    } else {
+      const matched = activeAccounts.find((a) => a.number.replace(/[^\d]/g, "") === paidToNumber.replace(/[^\d]/g, ""));
+      if (!matched) {
+        throw new ManualPaymentError(400, "Selected receiving payment number is invalid or inactive.");
+      }
+      paidToNumber = matched.number;
+    }
+  }
+  const { data: existingTrx } = await admin.from("payments").select("id, status").ilike("transaction_id", trxId).limit(1);
+  if (existingTrx && existingTrx.length > 0) {
+    throw new ManualPaymentError(409, "This Transaction ID has already been used. Duplicate Transaction IDs are not allowed.");
+  }
+  let amount = 0;
+  let currency = "BDT";
+  let targetTitle = "";
+  if (params.payment_for === "coin_package") {
+    const { data: pkg } = await admin.from("coin_packages").select("id, name, price, currency, status").eq("id", params.reference_id).maybeSingle();
+    if (!pkg || pkg.status !== "active") {
+      throw new ManualPaymentError(404, "Selected coin package is unavailable.");
+    }
+    amount = Number(pkg.price);
+    currency = pkg.currency || "BDT";
+    targetTitle = String(pkg.name || "Coin Package");
+  } else {
+    const { data: plan } = await admin.from("subscription_plans").select("id, name, monthly_price, currency, is_active").eq("id", params.reference_id).maybeSingle();
+    if (!plan || !plan.is_active) {
+      throw new ManualPaymentError(404, "Selected subscription plan is unavailable.");
+    }
+    amount = Number(plan.monthly_price);
+    currency = plan.currency || "BDT";
+    targetTitle = `${String(plan.name || "Subscription")} Plan`;
+  }
+  if (amount <= 0) {
+    throw new ManualPaymentError(400, "Manual payment is only applicable for paid packages or plans.");
+  }
+  const effectiveType = resolveEffectiveGatewayType(gateway);
+  const { data: payment, error } = await admin.from("payments").insert({
+    business_id: params.businessId,
+    user_id: params.userId,
+    gateway_slug: slug,
+    payment_for: params.payment_for,
+    reference_id: params.reference_id,
+    amount,
+    currency,
+    transaction_id: trxId,
+    sender_number: senderNumber,
+    proof_url: params.proof_url || "",
+    status: "pending",
+    gateway_response: {
+      gateway_name: gateway.name,
+      gateway_type: effectiveType,
+      paid_to_number: paidToNumber,
+      target_title: targetTitle
+    }
+  }).select("*").single();
+  if (error) {
+    if (error.code === "23505" || error.message.toLowerCase().includes("duplicate")) {
+      throw new ManualPaymentError(409, "This Transaction ID has already been used. Duplicate Transaction IDs are not allowed.");
+    }
+    throw new ManualPaymentError(400, error.message);
+  }
+  const { data: superAdmins } = await admin.from("profiles").select("id").eq("role", "super_admin").eq("status", "active");
+  for (const sa of superAdmins || []) {
+    await createNotification({
+      businessId: params.businessId,
+      userId: sa.id,
+      title: `New Manual Payment: ${gateway.name} (${amount} ${currency})`,
+      body: `TrxID ${trxId} submitted for ${targetTitle}. Verify in Admin Payment Queue.`,
+      type: "info",
+      link: "payments"
+    });
+  }
+  await writeAuditLog({
+    actorId: params.userId,
+    actorEmail: params.userEmail,
+    actorRole: params.userRole,
+    businessId: params.businessId,
+    action: "manual_payment_submitted",
+    targetType: "payment",
+    targetId: payment.id,
+    details: { gateway_slug: slug, transaction_id: trxId, paid_to_number: paidToNumber, amount, payment_for: params.payment_for },
+    ipAddress: params.ipAddress
+  });
+  return payment;
+}
+async function reviewManualPayment(params) {
+  const admin = getSupabaseAdmin();
+  const cleanNotes = String(params.adminNotes || "").trim().slice(0, 500);
+  if (params.decision !== "approved" && params.decision !== "rejected") {
+    throw new ManualPaymentError(400, "Decision must be either approved or rejected.");
+  }
+  if (params.decision === "rejected" && cleanNotes.length < 3) {
+    throw new ManualPaymentError(400, "Please enter a rejection reason for the customer.");
+  }
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const { data: claimed, error: claimErr } = await admin.from("payments").update({
+    status: params.decision,
+    admin_notes: cleanNotes,
+    reviewed_by: params.adminUser.id,
+    reviewed_at: nowIso,
+    updated_at: nowIso
+  }).eq("id", params.paymentId).eq("status", "pending").select("*").maybeSingle();
+  if (claimErr) {
+    throw new ManualPaymentError(400, claimErr.message);
+  }
+  if (!claimed) {
+    const { data: existing } = await admin.from("payments").select("id, status").eq("id", params.paymentId).maybeSingle();
+    if (!existing) {
+      throw new ManualPaymentError(404, "Payment request not found.");
+    }
+    throw new ManualPaymentError(
+      409,
+      `Payment is already ${existing.status}. A payment request can only be reviewed once.`
+    );
+  }
+  let fulfillmentNote = "";
+  if (params.decision === "approved") {
+    try {
+      if (claimed.payment_for === "coin_package" && claimed.reference_id) {
+        const { data: pkg, error: pkgErr } = await admin.from("coin_packages").select("*").eq("id", claimed.reference_id).maybeSingle();
+        if (pkgErr || !pkg) {
+          throw new Error("Referenced coin package not found.");
+        }
+        const totalCoins = Number(pkg.coin_amount) + Number(pkg.bonus_coins || 0);
+        const { error: creditErr } = await admin.rpc("credit_ai_coins_atomic", {
+          p_business_id: claimed.business_id,
+          p_amount: totalCoins,
+          p_type: "purchase",
+          p_description: `Manual Payment Approved (${claimed.transaction_id}): ${pkg.name} (${totalCoins} coins)`,
+          p_reference_id: claimed.id,
+          p_user_id: params.adminUser.id
+        });
+        if (creditErr) throw new Error(creditErr.message);
+        await admin.from("package_purchases").insert({
+          business_id: claimed.business_id,
+          user_id: claimed.user_id,
+          package_id: pkg.id,
+          coins_granted: totalCoins,
+          amount: claimed.amount,
+          currency: claimed.currency,
+          payment_id: claimed.id,
+          status: "completed"
+        });
+        fulfillmentNote = `${totalCoins.toLocaleString()} AI Coins added to your wallet for ${pkg.name}.`;
+      } else if (claimed.payment_for === "subscription" && claimed.reference_id) {
+        const { data: plan, error: planErr } = await admin.from("subscription_plans").select("*").eq("id", claimed.reference_id).maybeSingle();
+        if (planErr || !plan) {
+          throw new Error("Referenced subscription plan not found.");
+        }
+        const durationDays = Number(plan.duration_days || 30);
+        const expiresAt = new Date(Date.now() + durationDays * 864e5).toISOString();
+        const { error: bizErr } = await admin.from("businesses").update({
+          subscription_plan_id: plan.id,
+          subscription_status: "active",
+          subscription_expires_at: expiresAt,
+          updated_at: nowIso
+        }).eq("id", claimed.business_id);
+        if (bizErr) throw new Error(bizErr.message);
+        await admin.from("subscriptions").insert({
+          business_id: claimed.business_id,
+          plan_id: plan.id,
+          billing_cycle: durationDays >= 360 ? "yearly" : "monthly",
+          status: "active",
+          starts_at: nowIso,
+          expires_at: expiresAt,
+          amount_paid: claimed.amount,
+          payment_id: claimed.id
+        });
+        if (Number(plan.coin_allocation || 0) > 0) {
+          const { error: creditErr } = await admin.rpc("credit_ai_coins_atomic", {
+            p_business_id: claimed.business_id,
+            p_amount: Number(plan.coin_allocation),
+            p_type: "subscription_grant",
+            p_description: `${plan.name} subscription activated (TrxID: ${claimed.transaction_id})`,
+            p_reference_id: claimed.id,
+            p_user_id: params.adminUser.id
+          });
+          if (creditErr) throw new Error(creditErr.message);
+        }
+        fulfillmentNote = `${plan.name} subscription activated${Number(plan.coin_allocation || 0) > 0 ? ` with ${Number(plan.coin_allocation).toLocaleString()} AI Coins` : ""}.`;
+      }
+    } catch (fulfillErr) {
+      await admin.from("payments").update({
+        status: "pending",
+        reviewed_by: null,
+        reviewed_at: null,
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
+      }).eq("id", claimed.id);
+      throw new ManualPaymentError(
+        500,
+        `Payment fulfillment failed and was rolled back safely: ${fulfillErr instanceof Error ? fulfillErr.message : String(fulfillErr)}`
+      );
+    }
+  }
+  const gwMeta = claimed.gateway_response && typeof claimed.gateway_response === "object" ? claimed.gateway_response : {};
+  const targetTitle = String(gwMeta.target_title || claimed.payment_for.replace("_", " "));
+  const notifTitle = params.decision === "approved" ? `Payment Approved: ${targetTitle}` : `Payment Rejected: ${targetTitle}`;
+  const notifBody = params.decision === "approved" ? `TrxID ${claimed.transaction_id} (${claimed.amount} ${claimed.currency}) verified. ${fulfillmentNote}`.trim() : `TrxID ${claimed.transaction_id} (${claimed.amount} ${claimed.currency}) was rejected. Reason: ${cleanNotes}`;
+  const recipientIds = /* @__PURE__ */ new Set();
+  if (claimed.user_id) recipientIds.add(String(claimed.user_id));
+  const { data: biz } = await admin.from("businesses").select("owner_id").eq("id", claimed.business_id).maybeSingle();
+  if (biz?.owner_id) recipientIds.add(String(biz.owner_id));
+  for (const uid of recipientIds) {
+    await createNotification({
+      businessId: claimed.business_id,
+      userId: uid,
+      title: notifTitle,
+      body: notifBody,
+      type: params.decision === "approved" ? "success" : "error",
+      link: "wallet"
+    });
+  }
+  await writeAuditLog({
+    actorId: params.adminUser.id,
+    actorEmail: params.adminUser.email,
+    actorRole: params.adminUser.role,
+    businessId: claimed.business_id,
+    action: `payment_${params.decision}`,
+    targetType: "payment",
+    targetId: claimed.id,
+    details: {
+      amount: claimed.amount,
+      payment_for: claimed.payment_for,
+      transaction_id: claimed.transaction_id,
+      admin_notes: cleanNotes
+    },
+    ipAddress: params.adminUser.ip
+  });
+  return claimed;
+}
+function buildEncryptedCredentials(raw) {
+  const parsed = sanitizeGatewayCredentials(raw);
+  return parsed ? encryptSecret(JSON.stringify(parsed)) : "";
+}
+
+// server/routes/integrationsAndBillingRoutes.ts
 var router4 = Router4();
 router4.get("/catalog/plans", requireAuth, async (_req, res) => {
   try {
@@ -3452,11 +4247,11 @@ router4.get("/catalog/packages", requireAuth, async (_req, res) => {
 });
 router4.get("/catalog/gateways", requireAuth, async (_req, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const { data } = await admin.from("payment_gateways").select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, instructions").eq("is_active", true);
-    return res.json({ gateways: data || [] });
+    const gateways = await listActiveCatalogGateways();
+    return res.json({ gateways });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load gateways." });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Failed to load gateways." });
   }
 });
 router4.get("/businesses/:businessId/social", requireAuth, requireBusinessAccess("settings"), async (req, res) => {
@@ -3819,92 +4614,100 @@ router4.post("/businesses/:businessId/capi/test", requireAuth, requireBusinessAc
 });
 router4.get("/businesses/:businessId/couriers", requireAuth, requireBusinessAccess("orders"), requireFeature("courier"), async (req, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const [{ data: accounts }, { data: shipments }] = await Promise.all([
-      admin.from("courier_accounts").select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at").eq("business_id", req.businessId),
-      admin.from("courier_shipments").select("*, events:courier_tracking_events(*)").eq("business_id", req.businessId).order("created_at", { ascending: false }).limit(50)
-    ]);
-    const safeAccounts = (accounts || []).map((a) => ({
-      id: a.id,
-      provider: a.provider,
-      label: a.label,
-      client_id: a.client_id,
-      username: a.username,
-      store_id: a.store_id,
-      is_sandbox: a.is_sandbox,
-      is_active: a.is_active,
-      updated_at: a.updated_at,
-      has_api_key: Boolean(a.api_key_encrypted),
-      has_secret_key: Boolean(a.secret_key_encrypted),
-      has_client_secret: Boolean(a.client_secret_encrypted),
-      has_password: Boolean(a.password_encrypted)
-    }));
-    return res.json({ accounts: safeAccounts, shipments: shipments || [] });
+    const overview = await getBusinessCourierOverview(req.businessId);
+    return res.json(overview);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load couriers." });
   }
 });
 router4.put("/businesses/:businessId/couriers", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const { provider, label, api_key, secret_key, client_id, client_secret, username, password, store_id, is_sandbox, is_active } = req.body;
-    const prov = String(provider || "").trim();
-    if (!["steadfast", "pathao"].includes(prov)) {
-      return res.status(400).json({ error: "Valid courier provider (steadfast or pathao) is required." });
-    }
-    const { data: existing } = await admin.from("courier_accounts").select("id, api_key_encrypted, secret_key_encrypted, client_secret_encrypted, password_encrypted").eq("business_id", req.businessId).eq("provider", prov).maybeSingle();
-    if (prov === "steadfast") {
-      const hasKey = Boolean(String(api_key || "").trim() || existing?.api_key_encrypted);
-      const hasSec = Boolean(String(secret_key || "").trim() || existing?.secret_key_encrypted);
-      if (!hasKey || !hasSec) {
-        return res.status(400).json({ error: "Steadfast Api-Key and Secret-Key are required." });
-      }
-    } else {
-      const hasCid = Boolean(String(client_id || "").trim());
-      const hasCsec = Boolean(String(client_secret || "").trim() || existing?.client_secret_encrypted);
-      const hasUser = Boolean(String(username || "").trim());
-      const hasPass = Boolean(String(password || "").trim() || existing?.password_encrypted);
-      const hasStore = Boolean(String(store_id || "").trim());
-      if (!hasCid || !hasCsec || !hasUser || !hasPass || !hasStore) {
-        return res.status(400).json({ error: "Pathao Client ID, Client Secret, Username, Password, and Store ID are required." });
-      }
-    }
-    const payload = {
-      business_id: req.businessId,
-      provider: prov,
-      label: label ? String(label).trim() : prov.toUpperCase(),
-      is_sandbox: Boolean(is_sandbox),
-      is_active: is_active !== false,
-      updated_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    if (typeof api_key === "string" && api_key.trim()) payload.api_key_encrypted = encryptSecret(api_key.trim());
-    if (typeof secret_key === "string" && secret_key.trim()) payload.secret_key_encrypted = encryptSecret(secret_key.trim());
-    if (client_id !== void 0) payload.client_id = String(client_id || "").trim();
-    if (typeof client_secret === "string" && client_secret.trim()) payload.client_secret_encrypted = encryptSecret(client_secret.trim());
-    if (username !== void 0) payload.username = String(username || "").trim();
-    if (typeof password === "string" && password.trim()) payload.password_encrypted = encryptSecret(password.trim());
-    if (store_id !== void 0) payload.store_id = String(store_id || "").trim();
-    const { data, error } = await admin.from("courier_accounts").upsert(payload, { onConflict: "business_id,provider" }).select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at").single();
-    if (error) return res.status(400).json({ error: error.message });
-    return res.json({
-      account: {
-        id: data.id,
-        provider: data.provider,
-        label: data.label,
-        client_id: data.client_id,
-        username: data.username,
-        store_id: data.store_id,
-        is_sandbox: data.is_sandbox,
-        is_active: data.is_active,
-        updated_at: data.updated_at,
-        has_api_key: Boolean(data.api_key_encrypted),
-        has_secret_key: Boolean(data.secret_key_encrypted),
-        has_client_secret: Boolean(data.client_secret_encrypted),
-        has_password: Boolean(data.password_encrypted)
-      }
+    const result = await saveBusinessCourierAccount(req.businessId, req.body);
+    await writeAuditLog({
+      actorId: req.user.id,
+      actorEmail: req.user.email,
+      actorRole: req.user.role,
+      businessId: req.businessId,
+      action: "courier_credentials_saved",
+      targetType: "courier_account",
+      targetId: result.account.provider,
+      details: { is_active: result.account.is_active, is_default: result.account.is_default },
+      ipAddress: req.ip
     });
+    return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to save courier account." });
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Failed to save courier account." });
+  }
+});
+router4.post("/businesses/:businessId/couriers/:provider/reveal", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== "steadfast" && provider !== "pathao") {
+      return res.status(400).json({ error: "Invalid courier provider." });
+    }
+    const credentials = await revealBusinessCourierCredentials(req.businessId, provider);
+    await writeAuditLog({
+      actorId: req.user.id,
+      actorEmail: req.user.email,
+      actorRole: req.user.role,
+      businessId: req.businessId,
+      action: "courier_credentials_revealed",
+      targetType: "courier_account",
+      targetId: provider,
+      ipAddress: req.ip
+    });
+    return res.json({ credentials });
+  } catch (err) {
+    return res.status(404).json({ error: err instanceof Error ? err.message : "Unable to load courier credentials." });
+  }
+});
+router4.patch("/businesses/:businessId/couriers/:provider", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== "steadfast" && provider !== "pathao") {
+      return res.status(400).json({ error: "Invalid courier provider." });
+    }
+    const { is_active, is_default } = req.body;
+    const result = await updateBusinessCourierState(req.businessId, provider, {
+      ...typeof is_active === "boolean" ? { is_active } : {},
+      ...typeof is_default === "boolean" ? { is_default } : {}
+    });
+    await writeAuditLog({
+      actorId: req.user.id,
+      actorEmail: req.user.email,
+      actorRole: req.user.role,
+      businessId: req.businessId,
+      action: "courier_state_updated",
+      targetType: "courier_account",
+      targetId: provider,
+      details: { is_active: result.account.is_active, is_default: result.account.is_default },
+      ipAddress: req.ip
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Failed to update courier settings." });
+  }
+});
+router4.delete("/businesses/:businessId/couriers/:provider", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== "steadfast" && provider !== "pathao") {
+      return res.status(400).json({ error: "Invalid courier provider." });
+    }
+    const result = await disconnectBusinessCourier(req.businessId, provider);
+    await writeAuditLog({
+      actorId: req.user.id,
+      actorEmail: req.user.email,
+      actorRole: req.user.role,
+      businessId: req.businessId,
+      action: "courier_disconnected",
+      targetType: "courier_account",
+      targetId: provider,
+      ipAddress: req.ip
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Failed to disconnect courier." });
   }
 });
 router4.post("/businesses/:businessId/couriers/:provider/test", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
@@ -3923,7 +4726,9 @@ router4.post("/businesses/:businessId/orders/:orderId/book-courier", requireAuth
   try {
     const admin = getSupabaseAdmin();
     const { provider, cityId, zoneId, itemWeight, note } = req.body;
-    if (!provider) return res.status(400).json({ error: "Courier provider is required." });
+    if (provider && provider !== "steadfast" && provider !== "pathao") {
+      return res.status(400).json({ error: "Invalid courier provider." });
+    }
     const { data: order } = await admin.from("orders").select("*").eq("id", req.params.orderId).eq("business_id", req.businessId).maybeSingle();
     if (!order) return res.status(404).json({ error: "Order not found." });
     const booking = await bookCourierParcel({
@@ -4000,59 +4805,54 @@ router4.get("/businesses/:businessId/wallet", requireAuth, requireBusinessAccess
   try {
     const admin = getSupabaseAdmin();
     const businessId = req.businessId;
-    const [{ data: wallet }, { data: transactions }, { data: aiLogs }, { data: payments }] = await Promise.all([
+    const [{ data: wallet }, { data: transactions }, { data: aiLogs }, { data: payments }, { data: notifications }] = await Promise.all([
       admin.from("coin_wallets").select("*").eq("business_id", businessId).maybeSingle(),
       admin.from("coin_transactions").select("*").eq("business_id", businessId).order("created_at", { ascending: false }).limit(50),
       admin.from("ai_usage_logs").select("*").eq("business_id", businessId).order("created_at", { ascending: false }).limit(50),
-      admin.from("payments").select("*").eq("business_id", businessId).order("created_at", { ascending: false }).limit(30)
+      admin.from("payments").select("*").eq("business_id", businessId).order("created_at", { ascending: false }).limit(50),
+      admin.from("notifications").select("*").eq("business_id", businessId).eq("user_id", req.user.id).eq("link", "wallet").order("created_at", { ascending: false }).limit(20)
     ]);
     return res.json({
       wallet: wallet || { balance: 0, total_purchased: 0, total_used: 0, total_bonus: 0 },
       transactions: transactions || [],
       aiLogs: aiLogs || [],
-      payments: payments || []
+      payments: payments || [],
+      notifications: notifications || []
     });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load wallet." });
   }
 });
-router4.post("/businesses/:businessId/payments/submit", requireAuth, requireBusinessAccess(), async (req, res) => {
+router4.post("/businesses/:businessId/wallet/notifications/read", requireAuth, requireBusinessAccess(), async (req, res) => {
   try {
     const admin = getSupabaseAdmin();
-    const { gateway_slug, payment_for, reference_id, transaction_id, sender_number, proof_url } = req.body;
-    if (!gateway_slug || !payment_for || !reference_id || !transaction_id) {
-      return res.status(400).json({ error: "Gateway, payment target, reference ID, and Transaction ID are required." });
-    }
-    let amount = 0;
-    let currency = "BDT";
-    if (payment_for === "coin_package") {
-      const { data: pkg } = await admin.from("coin_packages").select("price, currency").eq("id", reference_id).maybeSingle();
-      if (!pkg) return res.status(404).json({ error: "Coin package not found." });
-      amount = Number(pkg.price);
-      currency = pkg.currency;
-    } else {
-      const { data: plan } = await admin.from("subscription_plans").select("monthly_price, currency").eq("id", reference_id).maybeSingle();
-      if (!plan) return res.status(404).json({ error: "Subscription plan not found." });
-      amount = Number(plan.monthly_price);
-      currency = plan.currency;
-    }
-    const { data: payment, error } = await admin.from("payments").insert({
-      business_id: req.businessId,
-      user_id: req.user.id,
-      gateway_slug,
+    await admin.from("notifications").update({ is_read: true }).eq("business_id", req.businessId).eq("user_id", req.user.id).eq("link", "wallet").eq("is_read", false);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to mark notifications read." });
+  }
+});
+router4.post("/businesses/:businessId/payments/submit", requireAuth, requireBusinessAccess(), async (req, res) => {
+  try {
+    const { gateway_slug, payment_for, reference_id, transaction_id, sender_number, paid_to_number, proof_url } = req.body;
+    const payment = await submitManualPayment({
+      businessId: req.businessId,
+      userId: req.user.id,
+      userEmail: req.user.email,
+      userRole: req.user.role,
+      gateway_slug: gateway_slug || "",
       payment_for,
-      reference_id,
-      amount,
-      currency,
-      transaction_id: transaction_id.trim(),
+      reference_id: reference_id || "",
+      transaction_id: transaction_id || "",
       sender_number: sender_number || "",
-      proof_url: proof_url || "",
-      status: "pending"
-    }).select("*").single();
-    if (error) return res.status(400).json({ error: error.message });
+      paid_to_number,
+      proof_url,
+      ipAddress: req.ip
+    });
     return res.status(201).json({ payment });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Payment submission failed." });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Payment submission failed." });
   }
 });
 router4.get("/businesses/:businessId/analytics", requireAuth, requireBusinessAccess("analytics"), requireFeature("analytics"), async (req, res) => {
@@ -4802,54 +5602,34 @@ router5.patch("/features/:key", async (req, res) => {
   await writeAuditLog({ actorId: req.user.id, actorEmail: req.user.email, actorRole: req.user.role, action: "feature_flag_updated", targetType: "feature_flag", targetId: req.params.key, details: req.body });
   return res.json({ feature: data });
 });
-var ALLOWED_GATEWAY_TYPES = /* @__PURE__ */ new Set(["manual", "bkash", "nagad", "sslcommerz", "custom"]);
-var GATEWAY_SLUG_REGEX = /^[a-z0-9][a-z0-9_-]{1,48}$/;
-function sanitizeGatewayConfigPublic(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const obj = raw;
-  const safe = {};
-  const allowedKeys = ["account_number", "account_type", "merchant_id", "bank_name", "routing_number", "display_note"];
-  for (const key of allowedKeys) {
-    if (typeof obj[key] === "string" && obj[key].trim()) {
-      safe[key] = obj[key].trim().slice(0, 200);
-    }
-  }
-  return safe;
-}
-function sanitizeGatewayCredentials(raw) {
-  if (!raw) return null;
-  if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    return trimmed ? { api_token: trimmed } : null;
-  }
-  if (typeof raw !== "object" || Array.isArray(raw)) return null;
-  const obj = raw;
-  const cleaned = {};
-  const allowedCredKeys = ["merchant_id", "api_key", "api_secret", "username", "password", "webhook_secret"];
-  for (const key of allowedCredKeys) {
-    if (typeof obj[key] === "string" && obj[key].trim()) {
-      cleaned[key] = obj[key].trim();
-    }
-  }
-  return Object.keys(cleaned).length > 0 ? cleaned : null;
-}
-function toSafeGatewayRow(row) {
-  const { credentials_encrypted, ...rest } = row;
-  return {
-    ...rest,
-    has_credentials: Boolean(typeof credentials_encrypted === "string" && credentials_encrypted.trim().length > 0)
-  };
-}
 router5.get("/payments", async (_req, res) => {
   const admin = getSupabaseAdmin();
   const [{ data: gateways }, { data: payments }] = await Promise.all([
     admin.from("payment_gateways").select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").order("slug"),
-    admin.from("payments").select("*, business:businesses(id, name, email)").order("created_at", { ascending: false }).limit(150)
+    admin.from("payments").select("*, business:businesses(id, name, email)").order("created_at", { ascending: false }).limit(200)
   ]);
   return res.json({
     gateways: (gateways || []).map((g) => toSafeGatewayRow(g)),
     payments: payments || []
   });
+});
+router5.put("/manual-payment-methods/:method", async (req, res) => {
+  try {
+    const method = String(req.params.method || "").trim().toLowerCase();
+    if (method !== "bkash" && method !== "nagad" && method !== "rocket") {
+      return res.status(400).json({ error: "Method must be bkash, nagad, or rocket." });
+    }
+    const { accounts, is_active, instructions, name } = req.body;
+    const gateway = await upsertManualGatewayAccounts(
+      method,
+      { accounts, is_active, instructions, name },
+      { id: req.user.id, email: req.user.email, role: req.user.role, ip: req.ip }
+    );
+    return res.json({ gateway });
+  } catch (err) {
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Failed to update manual payment method." });
+  }
 });
 router5.post("/payment-gateways", async (req, res) => {
   try {
@@ -4858,7 +5638,7 @@ router5.post("/payment-gateways", async (req, res) => {
     const name = typeof body.name === "string" ? body.name.trim() : "";
     const rawSlug = typeof body.slug === "string" && body.slug.trim() ? body.slug.trim() : name;
     const slug = rawSlug.toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
-    const gateway_type = typeof body.gateway_type === "string" ? body.gateway_type.trim() : "manual";
+    const gateway_type = typeof body.gateway_type === "string" ? body.gateway_type.trim().toLowerCase() : "manual";
     if (name.length < 2 || name.length > 100) {
       return res.status(400).json({ error: "Gateway name must be between 2 and 100 characters." });
     }
@@ -4866,27 +5646,37 @@ router5.post("/payment-gateways", async (req, res) => {
       return res.status(400).json({ error: "Gateway slug must be 2\u201349 lowercase letters, numbers, hyphens, or underscores." });
     }
     if (!ALLOWED_GATEWAY_TYPES.has(gateway_type)) {
-      return res.status(400).json({ error: "Invalid gateway_type. Allowed: manual, bkash, nagad, sslcommerz, custom." });
+      return res.status(400).json({ error: "Invalid gateway_type. Allowed: manual, bkash, nagad, rocket, sslcommerz, custom." });
     }
     const { data: existing } = await admin.from("payment_gateways").select("id").eq("slug", slug).maybeSingle();
     if (existing) {
       return res.status(409).json({ error: `A payment gateway with slug "${slug}" already exists.` });
     }
-    const config_public = sanitizeGatewayConfigPublic(body.config_public);
-    const parsedCredentials = sanitizeGatewayCredentials(body.credentials);
+    const config_public = sanitizeGatewayConfigPublic(
+      {
+        ...body.config_public && typeof body.config_public === "object" ? body.config_public : {},
+        ...gateway_type === "rocket" ? { manual_method: "rocket" } : {}
+      },
+      gateway_type || slug
+    );
+    const credentials_encrypted = buildEncryptedCredentials(body.credentials);
     const instructions = typeof body.instructions === "string" ? body.instructions.trim().slice(0, 1e3) : "";
-    const { data, error } = await admin.from("payment_gateways").insert({
+    const insertPayload = {
       slug,
       name,
       gateway_type,
       is_active: body.is_active !== false,
-      is_sandbox: body.is_sandbox !== false,
+      is_sandbox: body.is_sandbox === true,
       config_public,
-      credentials_encrypted: parsedCredentials ? encryptSecret(JSON.stringify(parsedCredentials)) : "",
+      credentials_encrypted,
       instructions,
       updated_at: (/* @__PURE__ */ new Date()).toISOString()
-    }).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
-    if (error) return res.status(400).json({ error: error.message });
+    };
+    let result = await admin.from("payment_gateways").insert(insertPayload).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    if (result.error && gateway_type === "rocket" && result.error.message.toLowerCase().includes("gateway_type")) {
+      result = await admin.from("payment_gateways").insert({ ...insertPayload, gateway_type: "manual" }).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    }
+    if (result.error) return res.status(400).json({ error: result.error.message });
     await writeAuditLog({
       actorId: req.user.id,
       actorEmail: req.user.email,
@@ -4894,12 +5684,13 @@ router5.post("/payment-gateways", async (req, res) => {
       action: "payment_gateway_created",
       targetType: "payment_gateway",
       targetId: slug,
-      details: { name, gateway_type, is_active: body.is_active !== false, is_sandbox: body.is_sandbox !== false },
+      details: { name, gateway_type, is_active: body.is_active !== false, is_sandbox: body.is_sandbox === true },
       ipAddress: req.ip
     });
-    return res.status(201).json({ gateway: toSafeGatewayRow(data) });
+    return res.status(201).json({ gateway: toSafeGatewayRow(result.data) });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to create payment gateway." });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Failed to create payment gateway." });
   }
 });
 router5.patch("/payment-gateways/:slug", async (req, res) => {
@@ -4915,6 +5706,11 @@ router5.patch("/payment-gateways/:slug", async (req, res) => {
       clear_credentials,
       instructions
     } = req.body;
+    const { data: existingGw } = await admin.from("payment_gateways").select("slug, gateway_type, config_public").eq("slug", req.params.slug).maybeSingle();
+    if (!existingGw) {
+      return res.status(404).json({ error: "Payment gateway not found." });
+    }
+    const effectiveType = typeof gateway_type === "string" ? gateway_type.trim().toLowerCase() : String(existingGw.gateway_type || req.params.slug);
     const payload = {
       updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
@@ -4926,26 +5722,38 @@ router5.patch("/payment-gateways/:slug", async (req, res) => {
       payload.name = trimmed;
     }
     if (typeof gateway_type === "string") {
-      if (!ALLOWED_GATEWAY_TYPES.has(gateway_type)) {
+      const normalizedType = gateway_type.trim().toLowerCase();
+      if (!ALLOWED_GATEWAY_TYPES.has(normalizedType)) {
         return res.status(400).json({ error: "Invalid gateway_type." });
       }
-      payload.gateway_type = gateway_type;
+      payload.gateway_type = normalizedType;
     }
     if (typeof is_active === "boolean") payload.is_active = is_active;
     if (typeof is_sandbox === "boolean") payload.is_sandbox = is_sandbox;
-    if (config_public !== void 0) payload.config_public = sanitizeGatewayConfigPublic(config_public);
+    if (config_public !== void 0) {
+      payload.config_public = sanitizeGatewayConfigPublic(
+        {
+          ...config_public && typeof config_public === "object" ? config_public : {},
+          ...effectiveType === "rocket" ? { manual_method: "rocket" } : {}
+        },
+        effectiveType
+      );
+    }
     if (typeof instructions === "string") payload.instructions = instructions.trim().slice(0, 1e3);
     let credentialsUpdated = false;
-    const parsedCredentials = sanitizeGatewayCredentials(credentials);
+    const encryptedCreds = buildEncryptedCredentials(credentials);
     if (clear_credentials === true) {
       payload.credentials_encrypted = "";
       credentialsUpdated = true;
-    } else if (parsedCredentials) {
-      payload.credentials_encrypted = encryptSecret(JSON.stringify(parsedCredentials));
+    } else if (encryptedCreds) {
+      payload.credentials_encrypted = encryptedCreds;
       credentialsUpdated = true;
     }
-    const { data, error } = await admin.from("payment_gateways").update(payload).eq("slug", req.params.slug).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
-    if (error) return res.status(400).json({ error: error.message });
+    let result = await admin.from("payment_gateways").update(payload).eq("slug", req.params.slug).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    if (result.error && payload.gateway_type === "rocket" && result.error.message.toLowerCase().includes("gateway_type")) {
+      result = await admin.from("payment_gateways").update({ ...payload, gateway_type: "manual" }).eq("slug", req.params.slug).select("id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at").single();
+    }
+    if (result.error) return res.status(400).json({ error: result.error.message });
     await writeAuditLog({
       actorId: req.user.id,
       actorEmail: req.user.email,
@@ -4956,17 +5764,18 @@ router5.patch("/payment-gateways/:slug", async (req, res) => {
       details: { is_active, is_sandbox, name: payload.name, gateway_type: payload.gateway_type, credentialsUpdated },
       ipAddress: req.ip
     });
-    return res.json({ gateway: toSafeGatewayRow(data) });
+    return res.json({ gateway: toSafeGatewayRow(result.data) });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to update payment gateway." });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Failed to update payment gateway." });
   }
 });
 router5.delete("/payment-gateways/:slug", async (req, res) => {
   try {
     const admin = getSupabaseAdmin();
     const slug = req.params.slug;
-    if (slug === "manual") {
-      return res.status(400).json({ error: "The default manual gateway cannot be deleted. You can disable it instead." });
+    if (slug === "manual" || slug === "bkash" || slug === "nagad" || slug === "rocket") {
+      return res.status(400).json({ error: "Built-in payment methods cannot be deleted. You can disable them instead." });
     }
     const { count } = await admin.from("payments").select("id", { count: "exact", head: true }).eq("gateway_slug", slug);
     if ((count || 0) > 0) {
@@ -4992,80 +5801,22 @@ router5.delete("/payment-gateways/:slug", async (req, res) => {
 });
 router5.post("/payments/:paymentId/review", async (req, res) => {
   try {
-    const admin = getSupabaseAdmin();
     const { decision, admin_notes } = req.body;
-    const { data: payment } = await admin.from("payments").select("*").eq("id", req.params.paymentId).maybeSingle();
-    if (!payment) return res.status(404).json({ error: "Payment not found." });
-    if (payment.status === "approved" && decision === "approved") {
-      return res.status(400).json({ error: "Payment is already approved." });
-    }
-    if (decision === "approved") {
-      if (payment.payment_for === "coin_package" && payment.reference_id) {
-        const { data: pkg } = await admin.from("coin_packages").select("*").eq("id", payment.reference_id).maybeSingle();
-        if (pkg) {
-          const totalCoins = Number(pkg.coin_amount) + Number(pkg.bonus_coins || 0);
-          await admin.rpc("credit_ai_coins_atomic", {
-            p_business_id: payment.business_id,
-            p_amount: totalCoins,
-            p_type: "purchase",
-            p_description: `Purchased ${pkg.name} (${totalCoins} coins)`,
-            p_reference_id: payment.id,
-            p_user_id: req.user.id
-          });
-          await admin.from("package_purchases").insert({
-            business_id: payment.business_id,
-            user_id: payment.user_id,
-            package_id: pkg.id,
-            coins_granted: totalCoins,
-            amount: payment.amount,
-            currency: payment.currency,
-            payment_id: payment.id,
-            status: "completed"
-          });
-        }
-      } else if (payment.payment_for === "subscription" && payment.reference_id) {
-        const { data: plan } = await admin.from("subscription_plans").select("*").eq("id", payment.reference_id).maybeSingle();
-        if (plan) {
-          const expiresAt = new Date(Date.now() + Number(plan.duration_days || 30) * 864e5).toISOString();
-          await admin.from("businesses").update({
-            subscription_plan_id: plan.id,
-            subscription_status: "active",
-            subscription_expires_at: expiresAt
-          }).eq("id", payment.business_id);
-          if (plan.coin_allocation > 0) {
-            await admin.rpc("credit_ai_coins_atomic", {
-              p_business_id: payment.business_id,
-              p_amount: plan.coin_allocation,
-              p_type: "subscription_grant",
-              p_description: `${plan.name} subscription coin allocation`,
-              p_reference_id: payment.id,
-              p_user_id: req.user.id
-            });
-          }
-        }
+    const updated = await reviewManualPayment({
+      paymentId: req.params.paymentId,
+      decision,
+      adminNotes: admin_notes,
+      adminUser: {
+        id: req.user.id,
+        email: req.user.email,
+        role: req.user.role,
+        ip: req.ip
       }
-    }
-    const { data: updated, error } = await admin.from("payments").update({
-      status: decision,
-      admin_notes: admin_notes || "",
-      reviewed_by: req.user.id,
-      reviewed_at: (/* @__PURE__ */ new Date()).toISOString()
-    }).eq("id", payment.id).select("*").single();
-    if (error) return res.status(400).json({ error: error.message });
-    await writeAuditLog({
-      actorId: req.user.id,
-      actorEmail: req.user.email,
-      actorRole: req.user.role,
-      businessId: payment.business_id,
-      action: `payment_${decision}`,
-      targetType: "payment",
-      targetId: payment.id,
-      details: { amount: payment.amount, payment_for: payment.payment_for },
-      ipAddress: req.ip
     });
     return res.json({ payment: updated });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Payment review failed." });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : "Payment review failed." });
   }
 });
 router5.get("/meta-settings", async (req, res) => {

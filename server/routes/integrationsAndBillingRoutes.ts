@@ -1,15 +1,26 @@
 import { Router } from 'express';
 import { encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
+import { writeAuditLog } from '../db/repository.ts';
 import { processCustomerMessageWithAi } from '../ai/customerAgent.ts';
 import { requireAuth, requireBusinessAccess, requireFeature, type AuthedRequest } from '../middleware/auth.ts';
 import {
   bookCourierParcel,
   checkSteadfastFraudByPhone,
+  disconnectBusinessCourier,
+  getBusinessCourierOverview,
   refreshCourierTracking,
+  revealBusinessCourierCredentials,
+  saveBusinessCourierAccount,
   syncActiveShipmentsForBusiness,
   testCourierConnection,
+  updateBusinessCourierState,
 } from '../services/courierService.ts';
 import { evaluateOrderRisk } from '../services/orderRisk.ts';
+import {
+  listActiveCatalogGateways,
+  ManualPaymentError,
+  submitManualPayment,
+} from '../services/manualPaymentService.ts';
 import {
   createMetaOAuthUrl,
   dispatchChannelReply,
@@ -46,14 +57,11 @@ router.get('/catalog/packages', requireAuth, async (_req, res) => {
 
 router.get('/catalog/gateways', requireAuth, async (_req, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const { data } = await admin
-      .from('payment_gateways')
-      .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, instructions')
-      .eq('is_active', true);
-    return res.json({ gateways: data || [] });
+    const gateways = await listActiveCatalogGateways();
+    return res.json({ gateways });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load gateways.' });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Failed to load gateways.' });
   }
 });
 
@@ -578,35 +586,8 @@ router.post('/businesses/:businessId/capi/test', requireAuth, requireBusinessAcc
 // Courier Management (Steadfast & Pathao)
 router.get('/businesses/:businessId/couriers', requireAuth, requireBusinessAccess('orders'), requireFeature('courier'), async (req: AuthedRequest, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const [{ data: accounts }, { data: shipments }] = await Promise.all([
-      admin
-        .from('courier_accounts')
-        .select('id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at')
-        .eq('business_id', req.businessId!),
-      admin
-        .from('courier_shipments')
-        .select('*, events:courier_tracking_events(*)')
-        .eq('business_id', req.businessId!)
-        .order('created_at', { ascending: false })
-        .limit(50),
-    ]);
-    const safeAccounts = (accounts || []).map((a) => ({
-      id: a.id,
-      provider: a.provider,
-      label: a.label,
-      client_id: a.client_id,
-      username: a.username,
-      store_id: a.store_id,
-      is_sandbox: a.is_sandbox,
-      is_active: a.is_active,
-      updated_at: a.updated_at,
-      has_api_key: Boolean(a.api_key_encrypted),
-      has_secret_key: Boolean(a.secret_key_encrypted),
-      has_client_secret: Boolean(a.client_secret_encrypted),
-      has_password: Boolean(a.password_encrypted),
-    }));
-    return res.json({ accounts: safeAccounts, shipments: shipments || [] });
+    const overview = await getBusinessCourierOverview(req.businessId!);
+    return res.json(overview);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load couriers.' });
   }
@@ -614,81 +595,95 @@ router.get('/businesses/:businessId/couriers', requireAuth, requireBusinessAcces
 
 router.put('/businesses/:businessId/couriers', requireAuth, requireBusinessAccess('settings'), requireFeature('courier'), async (req: AuthedRequest, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const { provider, label, api_key, secret_key, client_id, client_secret, username, password, store_id, is_sandbox, is_active } =
-      req.body as Record<string, unknown>;
-
-    const prov = String(provider || '').trim();
-    if (!['steadfast', 'pathao'].includes(prov)) {
-      return res.status(400).json({ error: 'Valid courier provider (steadfast or pathao) is required.' });
-    }
-
-    const { data: existing } = await admin
-      .from('courier_accounts')
-      .select('id, api_key_encrypted, secret_key_encrypted, client_secret_encrypted, password_encrypted')
-      .eq('business_id', req.businessId!)
-      .eq('provider', prov)
-      .maybeSingle();
-
-    if (prov === 'steadfast') {
-      const hasKey = Boolean(String(api_key || '').trim() || existing?.api_key_encrypted);
-      const hasSec = Boolean(String(secret_key || '').trim() || existing?.secret_key_encrypted);
-      if (!hasKey || !hasSec) {
-        return res.status(400).json({ error: 'Steadfast Api-Key and Secret-Key are required.' });
-      }
-    } else {
-      const hasCid = Boolean(String(client_id || '').trim());
-      const hasCsec = Boolean(String(client_secret || '').trim() || existing?.client_secret_encrypted);
-      const hasUser = Boolean(String(username || '').trim());
-      const hasPass = Boolean(String(password || '').trim() || existing?.password_encrypted);
-      const hasStore = Boolean(String(store_id || '').trim());
-      if (!hasCid || !hasCsec || !hasUser || !hasPass || !hasStore) {
-        return res.status(400).json({ error: 'Pathao Client ID, Client Secret, Username, Password, and Store ID are required.' });
-      }
-    }
-
-    const payload: Record<string, unknown> = {
-      business_id: req.businessId!,
-      provider: prov,
-      label: label ? String(label).trim() : prov.toUpperCase(),
-      is_sandbox: Boolean(is_sandbox),
-      is_active: is_active !== false,
-      updated_at: new Date().toISOString(),
-    };
-    if (typeof api_key === 'string' && api_key.trim()) payload.api_key_encrypted = encryptSecret(api_key.trim());
-    if (typeof secret_key === 'string' && secret_key.trim()) payload.secret_key_encrypted = encryptSecret(secret_key.trim());
-    if (client_id !== undefined) payload.client_id = String(client_id || '').trim();
-    if (typeof client_secret === 'string' && client_secret.trim()) payload.client_secret_encrypted = encryptSecret(client_secret.trim());
-    if (username !== undefined) payload.username = String(username || '').trim();
-    if (typeof password === 'string' && password.trim()) payload.password_encrypted = encryptSecret(password.trim());
-    if (store_id !== undefined) payload.store_id = String(store_id || '').trim();
-
-    const { data, error } = await admin
-      .from('courier_accounts')
-      .upsert(payload, { onConflict: 'business_id,provider' })
-      .select('id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at')
-      .single();
-
-    if (error) return res.status(400).json({ error: error.message });
-    return res.json({
-      account: {
-        id: data.id,
-        provider: data.provider,
-        label: data.label,
-        client_id: data.client_id,
-        username: data.username,
-        store_id: data.store_id,
-        is_sandbox: data.is_sandbox,
-        is_active: data.is_active,
-        updated_at: data.updated_at,
-        has_api_key: Boolean(data.api_key_encrypted),
-        has_secret_key: Boolean(data.secret_key_encrypted),
-        has_client_secret: Boolean(data.client_secret_encrypted),
-        has_password: Boolean(data.password_encrypted),
-      },
+    const result = await saveBusinessCourierAccount(req.businessId!, req.body as Record<string, unknown>);
+    await writeAuditLog({
+      actorId: req.user!.id,
+      actorEmail: req.user!.email,
+      actorRole: req.user!.role,
+      businessId: req.businessId!,
+      action: 'courier_credentials_saved',
+      targetType: 'courier_account',
+      targetId: result.account.provider,
+      details: { is_active: result.account.is_active, is_default: result.account.is_default },
+      ipAddress: req.ip,
     });
+    return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save courier account.' });
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to save courier account.' });
+  }
+});
+
+router.post('/businesses/:businessId/couriers/:provider/reveal', requireAuth, requireBusinessAccess('settings'), requireFeature('courier'), async (req: AuthedRequest, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== 'steadfast' && provider !== 'pathao') {
+      return res.status(400).json({ error: 'Invalid courier provider.' });
+    }
+    const credentials = await revealBusinessCourierCredentials(req.businessId!, provider);
+    await writeAuditLog({
+      actorId: req.user!.id,
+      actorEmail: req.user!.email,
+      actorRole: req.user!.role,
+      businessId: req.businessId!,
+      action: 'courier_credentials_revealed',
+      targetType: 'courier_account',
+      targetId: provider,
+      ipAddress: req.ip,
+    });
+    return res.json({ credentials });
+  } catch (err) {
+    return res.status(404).json({ error: err instanceof Error ? err.message : 'Unable to load courier credentials.' });
+  }
+});
+
+router.patch('/businesses/:businessId/couriers/:provider', requireAuth, requireBusinessAccess('settings'), requireFeature('courier'), async (req: AuthedRequest, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== 'steadfast' && provider !== 'pathao') {
+      return res.status(400).json({ error: 'Invalid courier provider.' });
+    }
+    const { is_active, is_default } = req.body as { is_active?: boolean; is_default?: boolean };
+    const result = await updateBusinessCourierState(req.businessId!, provider, {
+      ...(typeof is_active === 'boolean' ? { is_active } : {}),
+      ...(typeof is_default === 'boolean' ? { is_default } : {}),
+    });
+    await writeAuditLog({
+      actorId: req.user!.id,
+      actorEmail: req.user!.email,
+      actorRole: req.user!.role,
+      businessId: req.businessId!,
+      action: 'courier_state_updated',
+      targetType: 'courier_account',
+      targetId: provider,
+      details: { is_active: result.account.is_active, is_default: result.account.is_default },
+      ipAddress: req.ip,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update courier settings.' });
+  }
+});
+
+router.delete('/businesses/:businessId/couriers/:provider', requireAuth, requireBusinessAccess('settings'), requireFeature('courier'), async (req: AuthedRequest, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== 'steadfast' && provider !== 'pathao') {
+      return res.status(400).json({ error: 'Invalid courier provider.' });
+    }
+    const result = await disconnectBusinessCourier(req.businessId!, provider);
+    await writeAuditLog({
+      actorId: req.user!.id,
+      actorEmail: req.user!.email,
+      actorRole: req.user!.role,
+      businessId: req.businessId!,
+      action: 'courier_disconnected',
+      targetType: 'courier_account',
+      targetId: provider,
+      ipAddress: req.ip,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to disconnect courier.' });
   }
 });
 
@@ -715,7 +710,9 @@ router.post('/businesses/:businessId/orders/:orderId/book-courier', requireAuth,
       itemWeight?: number;
       note?: string;
     };
-    if (!provider) return res.status(400).json({ error: 'Courier provider is required.' });
+    if (provider && provider !== 'steadfast' && provider !== 'pathao') {
+      return res.status(400).json({ error: 'Invalid courier provider.' });
+    }
 
     const { data: order } = await admin
       .from('orders')
@@ -820,11 +817,19 @@ router.get('/businesses/:businessId/wallet', requireAuth, requireBusinessAccess(
   try {
     const admin = getSupabaseAdmin();
     const businessId = req.businessId!;
-    const [{ data: wallet }, { data: transactions }, { data: aiLogs }, { data: payments }] = await Promise.all([
+    const [{ data: wallet }, { data: transactions }, { data: aiLogs }, { data: payments }, { data: notifications }] = await Promise.all([
       admin.from('coin_wallets').select('*').eq('business_id', businessId).maybeSingle(),
       admin.from('coin_transactions').select('*').eq('business_id', businessId).order('created_at', { ascending: false }).limit(50),
       admin.from('ai_usage_logs').select('*').eq('business_id', businessId).order('created_at', { ascending: false }).limit(50),
-      admin.from('payments').select('*').eq('business_id', businessId).order('created_at', { ascending: false }).limit(30),
+      admin.from('payments').select('*').eq('business_id', businessId).order('created_at', { ascending: false }).limit(50),
+      admin
+        .from('notifications')
+        .select('*')
+        .eq('business_id', businessId)
+        .eq('user_id', req.user!.id)
+        .eq('link', 'wallet')
+        .order('created_at', { ascending: false })
+        .limit(20),
     ]);
 
     return res.json({
@@ -832,64 +837,60 @@ router.get('/businesses/:businessId/wallet', requireAuth, requireBusinessAccess(
       transactions: transactions || [],
       aiLogs: aiLogs || [],
       payments: payments || [],
+      notifications: notifications || [],
     });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load wallet.' });
   }
 });
 
-router.post('/businesses/:businessId/payments/submit', requireAuth, requireBusinessAccess(), async (req: AuthedRequest, res) => {
+router.post('/businesses/:businessId/wallet/notifications/read', requireAuth, requireBusinessAccess(), async (req: AuthedRequest, res) => {
   try {
     const admin = getSupabaseAdmin();
-    const { gateway_slug, payment_for, reference_id, transaction_id, sender_number, proof_url } = req.body as {
+    await admin
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('business_id', req.businessId!)
+      .eq('user_id', req.user!.id)
+      .eq('link', 'wallet')
+      .eq('is_read', false);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to mark notifications read.' });
+  }
+});
+
+router.post('/businesses/:businessId/payments/submit', requireAuth, requireBusinessAccess(), async (req: AuthedRequest, res) => {
+  try {
+    const { gateway_slug, payment_for, reference_id, transaction_id, sender_number, paid_to_number, proof_url } = req.body as {
       gateway_slug?: string;
       payment_for?: 'coin_package' | 'subscription';
       reference_id?: string;
       transaction_id?: string;
       sender_number?: string;
+      paid_to_number?: string;
       proof_url?: string;
     };
 
-    if (!gateway_slug || !payment_for || !reference_id || !transaction_id) {
-      return res.status(400).json({ error: 'Gateway, payment target, reference ID, and Transaction ID are required.' });
-    }
+    const payment = await submitManualPayment({
+      businessId: req.businessId!,
+      userId: req.user!.id,
+      userEmail: req.user!.email,
+      userRole: req.user!.role,
+      gateway_slug: gateway_slug || '',
+      payment_for: payment_for as 'coin_package' | 'subscription',
+      reference_id: reference_id || '',
+      transaction_id: transaction_id || '',
+      sender_number: sender_number || '',
+      paid_to_number,
+      proof_url,
+      ipAddress: req.ip,
+    });
 
-    let amount = 0;
-    let currency = 'BDT';
-    if (payment_for === 'coin_package') {
-      const { data: pkg } = await admin.from('coin_packages').select('price, currency').eq('id', reference_id).maybeSingle();
-      if (!pkg) return res.status(404).json({ error: 'Coin package not found.' });
-      amount = Number(pkg.price);
-      currency = pkg.currency;
-    } else {
-      const { data: plan } = await admin.from('subscription_plans').select('monthly_price, currency').eq('id', reference_id).maybeSingle();
-      if (!plan) return res.status(404).json({ error: 'Subscription plan not found.' });
-      amount = Number(plan.monthly_price);
-      currency = plan.currency;
-    }
-
-    const { data: payment, error } = await admin
-      .from('payments')
-      .insert({
-        business_id: req.businessId!,
-        user_id: req.user!.id,
-        gateway_slug,
-        payment_for,
-        reference_id,
-        amount,
-        currency,
-        transaction_id: transaction_id.trim(),
-        sender_number: sender_number || '',
-        proof_url: proof_url || '',
-        status: 'pending',
-      })
-      .select('*')
-      .single();
-
-    if (error) return res.status(400).json({ error: error.message });
     return res.status(201).json({ payment });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Payment submission failed.' });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Payment submission failed.' });
   }
 });
 

@@ -72,6 +72,7 @@ export default function App() {
   const [bootstrapModalOpen, setBootstrapModalOpen] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
   const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
+  const [oauthError, setOauthError] = useState('');
   const [authError, setAuthError] = useState('');
   const [publicStoreId, setPublicStoreId] = useState<string | null>(() => {
     try {
@@ -120,6 +121,22 @@ export default function App() {
         setDark(true);
       }
 
+      try {
+        const searchParams = new URLSearchParams(window.location.search);
+        const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+        const errDesc =
+          searchParams.get('error_description') ||
+          hashParams.get('error_description') ||
+          searchParams.get('error') ||
+          hashParams.get('error');
+        if (errDesc) {
+          setOauthError(errDesc);
+          setShowAuth(true);
+        }
+      } catch {
+        // ignore URL parse errors
+      }
+
       if (status.supabaseConnected && status.schemaReady && status.supabase.url && status.supabase.anonKey) {
         const client = initBrowserSupabase(status.supabase.url, status.supabase.anonKey);
         if (client) {
@@ -131,9 +148,23 @@ export default function App() {
             setAuthed(false);
           }
 
+          try {
+            const url = new URL(window.location.href);
+            if (url.searchParams.has('code') || url.searchParams.has('error') || url.searchParams.has('error_description')) {
+              url.searchParams.delete('code');
+              url.searchParams.delete('error');
+              url.searchParams.delete('error_description');
+              url.searchParams.delete('error_code');
+              window.history.replaceState({}, '', url.pathname + (url.search || ''));
+            }
+          } catch {
+            // ignore history errors
+          }
+
           client.auth.onAuthStateChange((_event, session) => {
             if (session) {
               setAuthed(true);
+              setOauthError('');
               void loadAccountContext();
             } else {
               setAuthed(false);
@@ -256,6 +287,7 @@ export default function App() {
           dark={dark}
           onToggleDark={() => setDark((d) => !d)}
           initialMode={authInitialMode}
+          initialError={oauthError}
           onBackToHome={() => setShowAuth(false)}
           onAuthenticated={() => void loadAccountContext()}
         />

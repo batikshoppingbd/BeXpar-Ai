@@ -42,8 +42,15 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
       const insertPayload = {
         id: userData.user.id,
         email: userData.user.email || '',
-        full_name: (userData.user.user_metadata?.full_name as string) || userData.user.email?.split('@')[0] || 'User',
-        avatar_url: (userData.user.user_metadata?.avatar_url as string) || '',
+        full_name:
+          (userData.user.user_metadata?.full_name as string) ||
+          (userData.user.user_metadata?.name as string) ||
+          userData.user.email?.split('@')[0] ||
+          'User',
+        avatar_url:
+          (userData.user.user_metadata?.avatar_url as string) ||
+          (userData.user.user_metadata?.picture as string) ||
+          '',
         role: 'business_owner',
         status: 'active',
         language: 'bn',

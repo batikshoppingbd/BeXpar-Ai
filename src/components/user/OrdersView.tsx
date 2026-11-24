@@ -25,6 +25,14 @@ interface OrdersViewProps {
   lang: Lang;
 }
 
+interface CourierAccountSummary {
+  provider: 'steadfast' | 'pathao';
+  is_active: boolean;
+  is_default?: boolean;
+  is_sandbox?: boolean;
+  store_id?: string;
+}
+
 const ORDER_STATUSES = [
   'pending',
   'confirmed',
@@ -78,6 +86,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ business, lang }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [courierAccounts, setCourierAccounts] = useState<CourierAccountSummary[]>([]);
+  const [defaultCourier, setDefaultCourier] = useState<'steadfast' | 'pathao' | null>(null);
+  const [selectedCourier, setSelectedCourier] = useState<'steadfast' | 'pathao'>('steadfast');
   const autoSyncedBusinessRef = useRef<string | null>(null);
 
   // Manual order form
@@ -91,12 +102,21 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ business, lang }) => {
   const loadOrders = async (): Promise<Order[]> => {
     setLoading(true);
     try {
-      const [ordRes, prodRes] = await Promise.all([
+      const [ordRes, prodRes, courierRes] = await Promise.all([
         apiFetch<{ orders: Order[] }>(`/api/businesses/${business.id}/orders`, { businessId: business.id }),
         apiFetch<{ products: Product[] }>(`/api/businesses/${business.id}/products`, { businessId: business.id }),
+        apiFetch<{ accounts: CourierAccountSummary[]; defaultProvider: 'steadfast' | 'pathao' | null }>(
+          `/api/businesses/${business.id}/couriers`,
+          { businessId: business.id }
+        ).catch(() => ({ accounts: [], defaultProvider: null })),
       ]);
       setOrders(ordRes.orders);
       setProducts(prodRes.products);
+      setCourierAccounts(courierRes.accounts || []);
+      setDefaultCourier(courierRes.defaultProvider || null);
+      if (courierRes.defaultProvider) {
+        setSelectedCourier(courierRes.defaultProvider);
+      }
       setSelectedOrder((prev) => {
         if (!prev) return null;
         return ordRes.orders.find((o) => o.id === prev.id) || prev;
@@ -300,6 +320,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ business, lang }) => {
 
   const handleOpenOrder = (order: Order) => {
     setSelectedOrder(order);
+    const existingProvider = order.shipments?.[0]?.provider || order.courier_name;
+    if (existingProvider === 'steadfast' || existingProvider === 'pathao') {
+      setSelectedCourier(existingProvider);
+    } else if (defaultCourier) {
+      setSelectedCourier(defaultCourier);
+    } else {
+      const firstActive = courierAccounts.find((c) => c.is_active)?.provider;
+      setSelectedCourier(firstActive || 'steadfast');
+    }
     if (!order.risk_reasons || order.risk_reasons.length === 0) {
       void handleDetectRisk(order.id, true);
     }
@@ -932,36 +961,113 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ business, lang }) => {
                 </div>
               ) : null}
 
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="text-xs text-slate-600 dark:text-slate-300">
-                  {selectedOrder.tracking_id
-                    ? lang === 'bn'
-                      ? 'প্রয়োজনে নতুন কুরিয়ার বুকিং করুন:'
-                      : 'Need another booking? Dispatch via courier API:'
-                    : lang === 'bn'
-                    ? 'কনফিগার করা কুরিয়ারে সরাসরি পার্সেল পাঠান:'
-                    : 'Book parcel directly via configured courier API:'}
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 p-3.5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                    {selectedOrder.tracking_id
+                      ? lang === 'bn'
+                        ? 'এই অর্ডারের জন্য কুরিয়ার পরিবর্তন বা পুনরায় বুক করুন:'
+                        : 'Switch courier or create a new booking for this order:'
+                      : lang === 'bn'
+                      ? 'এই অর্ডারের জন্য কুরিয়ার নির্বাচন করে পার্সেল বুক করুন:'
+                      : 'Select courier for this order & book parcel:'}
+                  </div>
+                  {defaultCourier && (
+                    <span className="px-2 py-0.5 rounded-full bg-[#F3F0FF] dark:bg-[#5B35F5]/20 text-[#5B35F5] dark:text-[#A78BFA] text-[10px] font-semibold uppercase">
+                      {lang === 'bn' ? `ডিফল্ট: ${defaultCourier}` : `Default: ${defaultCourier}`}
+                    </span>
+                  )}
                 </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={bookingLoading}
-                    onClick={() => void handleBookCourier(selectedOrder.id, 'steadfast')}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-700 text-white text-xs font-medium hover:bg-emerald-800 disabled:opacity-50"
-                  >
-                    {bookingLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Truck className="w-3.5 h-3.5" />}
-                    <span>Book Steadfast</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={bookingLoading}
-                    onClick={() => void handleBookCourier(selectedOrder.id, 'pathao')}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 text-white text-xs font-medium hover:bg-rose-700 disabled:opacity-50"
-                  >
-                    <Truck className="w-3.5 h-3.5" />
-                    <span>Book Pathao</span>
-                  </button>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {(['steadfast', 'pathao'] as const).map((prov) => {
+                    const acc = courierAccounts.find((c) => c.provider === prov);
+                    const isConfigured = Boolean(acc);
+                    const isActive = Boolean(acc?.is_active);
+                    const isSelected = selectedCourier === prov;
+                    const isDef = defaultCourier === prov || acc?.is_default;
+                    return (
+                      <button
+                        key={prov}
+                        type="button"
+                        onClick={() => setSelectedCourier(prov)}
+                        className={`flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl border text-left text-xs transition-all ${
+                          isSelected
+                            ? 'border-[#5B35F5] bg-[#F3F0FF]/80 dark:bg-[#5B35F5]/15 ring-2 ring-[#5B35F5]/20'
+                            : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-[#5B35F5]/50'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 ${
+                              isSelected ? 'border-[#5B35F5] bg-[#5B35F5]' : 'border-slate-300 dark:border-slate-600'
+                            }`}
+                          >
+                            {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                          </span>
+                          <span className="font-bold text-slate-900 dark:text-white capitalize truncate">
+                            {prov === 'steadfast' ? 'Steadfast Courier' : 'Pathao Courier'}
+                          </span>
+                          {isDef && (
+                            <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300 text-[10px] font-semibold">
+                              Default
+                            </span>
+                          )}
+                        </div>
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
+                            !isConfigured
+                              ? 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                              : isActive
+                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                              : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                          }`}
+                        >
+                          {!isConfigured ? (lang === 'bn' ? 'সেটআপ নেই' : 'Not Setup') : isActive ? 'Active' : 'Inactive'}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
+
+                {(() => {
+                  const chosenAcc = courierAccounts.find((c) => c.provider === selectedCourier);
+                  const canBook = Boolean(chosenAcc?.is_active);
+                  return (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <span className="text-[11px] text-slate-600 dark:text-slate-400">
+                        {!chosenAcc
+                          ? lang === 'bn'
+                            ? `${selectedCourier.toUpperCase()} এখনো Integrations থেকে কানেক্ট করা হয়নি।`
+                            : `${selectedCourier.toUpperCase()} is not connected yet in Integrations.`
+                          : !chosenAcc.is_active
+                          ? lang === 'bn'
+                            ? `${selectedCourier.toUpperCase()} বর্তমানে Inactive আছে। Integrations থেকে Active করুন।`
+                            : `${selectedCourier.toUpperCase()} is currently Inactive. Enable it in Integrations.`
+                          : lang === 'bn'
+                          ? `${selectedCourier.toUpperCase()} এর মাধ্যমে প্রকৃত পার্সেল বুকিং হবে ও Tracking ID সেভ হবে।`
+                          : `Parcel will be booked via ${selectedCourier.toUpperCase()} and Booking/Tracking ID will be saved.`}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={bookingLoading || !canBook}
+                        onClick={() => void handleBookCourier(selectedOrder.id, selectedCourier)}
+                        className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-white text-xs font-semibold transition-colors disabled:opacity-50 ${
+                          selectedCourier === 'pathao'
+                            ? 'bg-rose-600 hover:bg-rose-700'
+                            : 'bg-emerald-700 hover:bg-emerald-800'
+                        }`}
+                      >
+                        {bookingLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Truck className="w-3.5 h-3.5" />}
+                        <span>
+                          {lang === 'bn'
+                            ? `${selectedCourier === 'steadfast' ? 'Steadfast' : 'Pathao'}-এ পার্সেল পাঠান`
+                            : `Book via ${selectedCourier === 'steadfast' ? 'Steadfast' : 'Pathao'}`}
+                        </span>
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           </div>

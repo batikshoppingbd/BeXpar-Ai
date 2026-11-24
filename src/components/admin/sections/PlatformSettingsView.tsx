@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Check,
   CheckCircle2,
   Copy,
   CreditCard,
@@ -10,6 +11,7 @@ import {
   Layers,
   Plus,
   Share2,
+  Smartphone,
   Trash2,
   XCircle,
 } from 'lucide-react';
@@ -53,12 +55,45 @@ export const PlatformSettingsView: React.FC<{
   const [gateways, setGateways] = useState<Array<Record<string, unknown>>>([]);
   const [payments, setPayments] = useState<Array<Record<string, unknown>>>([]);
   const [payFilter, setPayFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
-  const [reviewConfirm, setReviewConfirm] = useState<{
+  const [reviewModal, setReviewModal] = useState<{
     id: string;
     decision: 'approved' | 'rejected';
     amount: number;
+    currency: string;
     bizName: string;
+    trxId: string;
+    senderNumber: string;
+    paidToNumber: string;
+    gatewaySlug: string;
+    targetTitle: string;
   } | null>(null);
+  const [reviewNotes, setReviewNotes] = useState('');
+  const [reviewError, setReviewError] = useState('');
+  const [reviewLoading, setReviewLoading] = useState(false);
+
+  // Manual Payment Methods Manager (bKash max 9, Nagad & Rocket multiple)
+  type ManualMethodSlug = 'bkash' | 'nagad' | 'rocket';
+  type ManualAccountItem = {
+    id: string;
+    number: string;
+    account_type: string;
+    label: string;
+    instructions: string;
+    is_active: boolean;
+  };
+  const [activeMfsMethod, setActiveMfsMethod] = useState<ManualMethodSlug>('bkash');
+  const [mfsInstructionsDraft, setMfsInstructionsDraft] = useState('');
+  const [mfsSaving, setMfsSaving] = useState(false);
+  const [mfsAccountModalOpen, setMfsAccountModalOpen] = useState(false);
+  const [mfsEditingAccountId, setMfsEditingAccountId] = useState<string | null>(null);
+  const [mfsAccountForm, setMfsAccountForm] = useState({
+    number: '',
+    account_type: 'Personal',
+    label: '',
+    instructions: '',
+    is_active: true,
+  });
+
   const [gatewayModalOpen, setGatewayModalOpen] = useState(false);
   const [gatewayMode, setGatewayMode] = useState<'create' | 'edit'>('create');
   const [gatewaySlugTouched, setGatewaySlugTouched] = useState(false);
@@ -67,7 +102,7 @@ export const PlatformSettingsView: React.FC<{
   const [gatewayForm, setGatewayForm] = useState({
     slug: '',
     name: '',
-    gateway_type: 'bkash' as 'manual' | 'bkash' | 'nagad' | 'sslcommerz' | 'custom',
+    gateway_type: 'bkash' as 'manual' | 'bkash' | 'nagad' | 'rocket' | 'sslcommerz' | 'custom',
     is_active: true,
     is_sandbox: false,
     account_number: '',
@@ -144,7 +179,160 @@ export const PlatformSettingsView: React.FC<{
     void loadSubTab(subTab);
   }, [subTab]);
 
+  const parseGatewayAccounts = (gw?: Record<string, unknown>): ManualAccountItem[] => {
+    if (!gw) return [];
+    if (Array.isArray(gw.accounts)) {
+      return (gw.accounts as Array<Record<string, unknown>>).map((a, idx) => ({
+        id: String(a.id || `acc_${idx + 1}`),
+        number: String(a.number || ''),
+        account_type: String(a.account_type || 'Personal'),
+        label: String(a.label || ''),
+        instructions: String(a.instructions || ''),
+        is_active: a.is_active !== false,
+      }));
+    }
+    const cfg = (gw.config_public && typeof gw.config_public === 'object' ? gw.config_public : {}) as Record<string, unknown>;
+    if (Array.isArray(cfg.accounts)) {
+      return (cfg.accounts as Array<Record<string, unknown>>).map((a, idx) => ({
+        id: String(a.id || `acc_${idx + 1}`),
+        number: String(a.number || ''),
+        account_type: String(a.account_type || 'Personal'),
+        label: String(a.label || ''),
+        instructions: String(a.instructions || ''),
+        is_active: a.is_active !== false,
+      }));
+    }
+    if (typeof cfg.account_number === 'string' && cfg.account_number.trim()) {
+      return [
+        {
+          id: 'primary',
+          number: cfg.account_number.trim(),
+          account_type: typeof cfg.account_type === 'string' && cfg.account_type.trim() ? cfg.account_type.trim() : 'Personal',
+          label: typeof cfg.display_note === 'string' ? cfg.display_note.trim() : '',
+          instructions: '',
+          is_active: true,
+        },
+      ];
+    }
+    return [];
+  };
+
+  const activeMfsGateway = gateways.find((g) => String(g.slug || '').toLowerCase() === activeMfsMethod);
+  const activeMfsAccounts = parseGatewayAccounts(activeMfsGateway);
+
+  useEffect(() => {
+    if (subTab === 'payments') {
+      const gw = gateways.find((g) => String(g.slug || '').toLowerCase() === activeMfsMethod);
+      setMfsInstructionsDraft(String(gw?.instructions || ''));
+    }
+  }, [activeMfsMethod, gateways, subTab]);
+
+  const saveManualMethodPayload = async (
+    method: ManualMethodSlug,
+    payload: { accounts?: ManualAccountItem[]; is_active?: boolean; instructions?: string },
+    successMsg: string
+  ) => {
+    setMfsSaving(true);
+    try {
+      await apiFetch(`/api/admin/manual-payment-methods/${method}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      onNotify(successMsg);
+      await loadSubTab('payments');
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Failed to update manual payment method.');
+    } finally {
+      setMfsSaving(false);
+    }
+  };
+
+  const openAddMfsNumberModal = () => {
+    if (activeMfsMethod === 'bkash' && activeMfsAccounts.length >= 9) {
+      onError(lang === 'bn' ? 'bKash-এ সর্বোচ্চ ৯টি নম্বর যুক্ত করা যাবে।' : 'bKash allows a maximum of 9 payment numbers.');
+      return;
+    }
+    setMfsEditingAccountId(null);
+    setMfsAccountForm({
+      number: '',
+      account_type: 'Personal',
+      label: '',
+      instructions: '',
+      is_active: true,
+    });
+    setMfsAccountModalOpen(true);
+  };
+
+  const openEditMfsNumberModal = (acc: ManualAccountItem) => {
+    setMfsEditingAccountId(acc.id);
+    setMfsAccountForm({
+      number: acc.number,
+      account_type: acc.account_type || 'Personal',
+      label: acc.label || '',
+      instructions: acc.instructions || '',
+      is_active: acc.is_active,
+    });
+    setMfsAccountModalOpen(true);
+  };
+
+  const handleSaveMfsAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanedNumber = mfsAccountForm.number.replace(/[\s()-]+/g, '').trim();
+    if (!cleanedNumber) {
+      onError(lang === 'bn' ? 'সঠিক পেমেন্ট নম্বর দিন।' : 'Please enter a valid payment number.');
+      return;
+    }
+
+    let nextAccounts: ManualAccountItem[];
+    if (mfsEditingAccountId) {
+      nextAccounts = activeMfsAccounts.map((item) =>
+        item.id === mfsEditingAccountId
+          ? {
+              ...item,
+              number: cleanedNumber,
+              account_type: mfsAccountForm.account_type.trim() || 'Personal',
+              label: mfsAccountForm.label.trim(),
+              instructions: mfsAccountForm.instructions.trim(),
+              is_active: mfsAccountForm.is_active,
+            }
+          : item
+      );
+    } else {
+      const nextId = `num_${Date.now().toString(36)}`;
+      nextAccounts = [
+        ...activeMfsAccounts,
+        {
+          id: nextId,
+          number: cleanedNumber,
+          account_type: mfsAccountForm.account_type.trim() || 'Personal',
+          label: mfsAccountForm.label.trim(),
+          instructions: mfsAccountForm.instructions.trim(),
+          is_active: mfsAccountForm.is_active,
+        },
+      ];
+    }
+
+    await saveManualMethodPayload(
+      activeMfsMethod,
+      { accounts: nextAccounts },
+      mfsEditingAccountId
+        ? lang === 'bn'
+          ? 'পেমেন্ট নম্বর আপডেট হয়েছে।'
+          : 'Payment number updated.'
+        : lang === 'bn'
+        ? 'নতুন পেমেন্ট নম্বর যুক্ত হয়েছে।'
+        : 'Payment number added.'
+    );
+    setMfsAccountModalOpen(false);
+  };
+
   const filteredPayments = payments.filter((p) => payFilter === 'all' || p.status === payFilter);
+  const paymentCounts = {
+    all: payments.length,
+    pending: payments.filter((p) => p.status === 'pending').length,
+    approved: payments.filter((p) => p.status === 'approved').length,
+    rejected: payments.filter((p) => p.status === 'rejected').length,
+  };
 
   const openCreateGatewayModal = () => {
     setGatewayMode('create');
@@ -177,7 +365,7 @@ export const PlatformSettingsView: React.FC<{
     setGatewayForm({
       slug: String(g.slug || ''),
       name: String(g.name || ''),
-      gateway_type: (String(g.gateway_type || 'manual') as 'manual' | 'bkash' | 'nagad' | 'sslcommerz' | 'custom'),
+      gateway_type: (String(g.gateway_type || 'manual') as 'manual' | 'bkash' | 'nagad' | 'rocket' | 'sslcommerz' | 'custom'),
       is_active: Boolean(g.is_active),
       is_sandbox: Boolean(g.is_sandbox),
       account_number: String(cfg.account_number || ''),
@@ -511,6 +699,254 @@ export const PlatformSettingsView: React.FC<{
       {/* 3. Payments & Gateways */}
       {subTab === 'payments' && (
         <div className="space-y-5">
+          {/* Manual Payment Methods Manager: bKash (max 9), Nagad (multiple), Rocket (multiple) */}
+          <div className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Smartphone className="w-4 h-4 text-[#5B35F5]" />
+                  <h3 className="text-base font-display font-bold text-[#101536] dark:text-white">
+                    {lang === 'bn'
+                      ? 'ম্যানুয়াল পেমেন্ট নম্বর ম্যানেজমেন্ট (bKash · Nagad · Rocket)'
+                      : 'Manual Payment Numbers (bKash · Nagad · Rocket)'}
+                  </h3>
+                </div>
+                <p className="text-xs text-[#7C8499] mt-0.5">
+                  {lang === 'bn'
+                    ? 'কোনো পেমেন্ট গেটওয়ে ছাড়াই bKash (সর্বোচ্চ ৯টি), Nagad ও Rocket-এর একাধিক নম্বর ও নির্দেশনা পরিচালনা করুন।'
+                    : 'Manage receiving numbers without any payment gateway: up to 9 for bKash, and multiple numbers for Nagad & Rocket.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {(['bkash', 'nagad', 'rocket'] as const).map((methodKey) => {
+                  const gwRow = gateways.find((g) => String(g.slug || '').toLowerCase() === methodKey);
+                  const nums = parseGatewayAccounts(gwRow);
+                  const activeCount = nums.filter((a) => a.is_active).length;
+                  const label = methodKey === 'bkash' ? 'bKash' : methodKey === 'nagad' ? 'Nagad' : 'Rocket';
+                  const isSel = activeMfsMethod === methodKey;
+                  return (
+                    <button
+                      key={methodKey}
+                      type="button"
+                      onClick={() => setActiveMfsMethod(methodKey)}
+                      className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-all ${
+                        isSel
+                          ? 'bg-[#5B35F5] text-white border-[#5B35F5] shadow-xs'
+                          : 'bg-[#F8F9FC] dark:bg-slate-950 text-[#101536] dark:text-slate-200 border-[#E6E0FF] dark:border-slate-800 hover:bg-[#F3F0FF]'
+                      }`}
+                    >
+                      <span>{label}</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded-md text-[10px] tabular-nums ${
+                          isSel
+                            ? 'bg-white/20 text-white'
+                            : 'bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA]'
+                        }`}
+                      >
+                        {methodKey === 'bkash' ? `${nums.length}/9` : `${activeCount}/${nums.length}`}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {(() => {
+              const methodTitle =
+                activeMfsMethod === 'bkash' ? 'bKash' : activeMfsMethod === 'nagad' ? 'Nagad' : 'Rocket';
+              const isMethodActive = activeMfsGateway ? Boolean(activeMfsGateway.is_active) : false;
+              const isBkashFull = activeMfsMethod === 'bkash' && activeMfsAccounts.length >= 9;
+              return (
+                <div className="rounded-2xl border border-[#E6E0FF] dark:border-slate-800 bg-[#F9F7FF]/60 dark:bg-slate-950/60 p-4 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 flex-wrap">
+                      <span className="text-sm font-display font-bold text-[#101536] dark:text-white">
+                        {methodTitle}
+                      </span>
+                      <StatusBadge status={isMethodActive ? 'active' : 'inactive'} />
+                      <span className="text-[11px] font-semibold text-[#7C8499] tabular-nums">
+                        {activeMfsMethod === 'bkash'
+                          ? `${activeMfsAccounts.length} / 9 ${lang === 'bn' ? 'নম্বর' : 'Numbers Max'}`
+                          : `${activeMfsAccounts.filter((a) => a.is_active).length} Active · ${activeMfsAccounts.length} Total`}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={mfsSaving}
+                        onClick={() =>
+                          void saveManualMethodPayload(
+                            activeMfsMethod,
+                            { is_active: !isMethodActive, accounts: activeMfsAccounts },
+                            `${methodTitle} ${!isMethodActive ? 'enabled' : 'disabled'}.`
+                          )
+                        }
+                        className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition-colors ${
+                          isMethodActive
+                            ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300'
+                            : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300'
+                        }`}
+                      >
+                        {isMethodActive
+                          ? lang === 'bn'
+                            ? 'Method নিষ্ক্রিয় করুন'
+                            : 'Set Method Inactive'
+                          : lang === 'bn'
+                          ? 'Method সক্রিয় করুন'
+                          : 'Set Method Active'}
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={mfsSaving || isBkashFull}
+                        onClick={openAddMfsNumberModal}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[#5B35F5] hover:bg-[#4520D9] text-white text-xs font-semibold disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>
+                          {isBkashFull
+                            ? lang === 'bn'
+                              ? 'bKash সীমা পূর্ণ (৯/৯)'
+                              : 'bKash Limit Reached (9/9)'
+                            : lang === 'bn'
+                            ? `${methodTitle} নম্বর যোগ করুন`
+                            : `Add ${methodTitle} Number`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Send Money Instructions */}
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="text"
+                      value={mfsInstructionsDraft}
+                      onChange={(e) => setMfsInstructionsDraft(e.target.value)}
+                      placeholder={
+                        lang === 'bn'
+                          ? `${methodTitle} Send Money নির্দেশনা লিখুন...`
+                          : `${methodTitle} Send Money instructions shown to users...`
+                      }
+                      className="flex-1 px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                    />
+                    <button
+                      type="button"
+                      disabled={mfsSaving}
+                      onClick={() =>
+                        void saveManualMethodPayload(
+                          activeMfsMethod,
+                          { instructions: mfsInstructionsDraft, accounts: activeMfsAccounts },
+                          `${methodTitle} instructions saved.`
+                        )
+                      }
+                      className="px-4 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-white dark:bg-slate-900 text-[#5B35F5] dark:text-[#A78BFA] text-xs font-semibold hover:bg-[#F3F0FF] shrink-0"
+                    >
+                      {lang === 'bn' ? 'নির্দেশনা সেভ' : 'Save Instructions'}
+                    </button>
+                  </div>
+
+                  {/* Numbers List */}
+                  {activeMfsAccounts.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-[#E6E0FF] dark:border-slate-800 bg-white/70 dark:bg-slate-900/50 p-5 text-center text-xs text-[#7C8499]">
+                      {lang === 'bn'
+                        ? `এখনো কোনো ${methodTitle} পেমেন্ট নম্বর যুক্ত করা হয়নি। উপরে "Add ${methodTitle} Number" বাটনে ক্লিক করুন।`
+                        : `No ${methodTitle} payment numbers configured yet. Click "Add ${methodTitle} Number" above to add one.`}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                      {activeMfsAccounts.map((acc) => (
+                        <div
+                          key={acc.id}
+                          className="rounded-xl border border-[#E6E0FF] dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-2.5"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono font-bold text-sm text-[#101536] dark:text-white truncate">
+                                  {acc.number}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void navigator.clipboard.writeText(acc.number);
+                                    onNotify(`Copied ${acc.number}`);
+                                  }}
+                                  className="p-1 rounded-md text-[#7C8499] hover:text-[#5B35F5] hover:bg-[#F3F0FF] dark:hover:bg-slate-800"
+                                  title="Copy number"
+                                >
+                                  <Copy className="w-3 h-3" />
+                                </button>
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                <span className="px-1.5 py-0.5 rounded bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-[10px] font-semibold">
+                                  {acc.account_type || 'Personal'}
+                                </span>
+                                {acc.label && (
+                                  <span className="text-[11px] text-[#7C8499] truncate">{acc.label}</span>
+                                )}
+                              </div>
+                            </div>
+                            <StatusBadge status={acc.is_active ? 'active' : 'inactive'} />
+                          </div>
+
+                          {acc.instructions && (
+                            <p className="text-[11px] text-[#7C8499] line-clamp-2">{acc.instructions}</p>
+                          )}
+
+                          <div className="flex items-center gap-1.5 pt-2 border-t border-[#E6E0FF]/60 dark:border-slate-800">
+                            <button
+                              type="button"
+                              disabled={mfsSaving}
+                              onClick={() => {
+                                const next = activeMfsAccounts.map((item) =>
+                                  item.id === acc.id ? { ...item, is_active: !item.is_active } : item
+                                );
+                                void saveManualMethodPayload(
+                                  activeMfsMethod,
+                                  { accounts: next },
+                                  `${acc.number} marked ${!acc.is_active ? 'active' : 'inactive'}.`
+                                );
+                              }}
+                              className="px-2.5 py-1 rounded-lg border border-[#E6E0FF] dark:border-slate-700 text-[11px] font-semibold hover:bg-[#F3F0FF] dark:hover:bg-slate-800"
+                            >
+                              {acc.is_active ? 'Disable' : 'Enable'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={mfsSaving}
+                              onClick={() => openEditMfsNumberModal(acc)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-[11px] font-semibold"
+                            >
+                              <Edit3 className="w-3 h-3" />
+                              <span>{adminT(lang, 'edit')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={mfsSaving}
+                              onClick={() => {
+                                const next = activeMfsAccounts.filter((item) => item.id !== acc.id);
+                                void saveManualMethodPayload(
+                                  activeMfsMethod,
+                                  { accounts: next },
+                                  `${acc.number} deleted.`
+                                );
+                              }}
+                              className="ml-auto p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                              title={adminT(lang, 'delete')}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
           <div className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h3 className="text-base font-display font-bold text-[#101536] dark:text-white">
@@ -534,9 +970,11 @@ export const PlatformSettingsView: React.FC<{
                 string,
                 unknown
               >;
+              const accounts = parseGatewayAccounts(g);
               const accNum = cfg.account_number ? String(cfg.account_number) : '';
               const accType = cfg.account_type ? String(cfg.account_type) : '';
               const slug = String(g.slug || '');
+              const isBuiltIn = slug === 'manual' || slug === 'bkash' || slug === 'nagad' || slug === 'rocket';
               return (
                 <div
                   key={String(g.id)}
@@ -553,6 +991,11 @@ export const PlatformSettingsView: React.FC<{
                           <span className="px-1.5 py-0.5 rounded-md bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-[10px] font-semibold uppercase">
                             {String(g.gateway_type || 'manual')}
                           </span>
+                          {accounts.length > 0 && (
+                            <span className="px-1.5 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 text-[10px] font-semibold">
+                              {accounts.filter((a) => a.is_active).length}/{accounts.length} active
+                            </span>
+                          )}
                         </div>
                       </div>
                       <StatusBadge status={g.is_active ? 'active' : 'inactive'} />
@@ -633,7 +1076,7 @@ export const PlatformSettingsView: React.FC<{
                       <Edit3 className="w-3.5 h-3.5" />
                       <span>{adminT(lang, 'edit')}</span>
                     </button>
-                    {slug !== 'manual' && (
+                    {!isBuiltIn && (
                       <button
                         type="button"
                         onClick={() => setDeleteGatewayConfirm({ slug, name: String(g.name || slug) })}
@@ -651,20 +1094,30 @@ export const PlatformSettingsView: React.FC<{
 
           <div className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <h3 className="text-base font-display font-bold text-[#101536] dark:text-white">
-                Payment Verification Queue
-              </h3>
-              <div className="flex gap-1.5">
+              <div>
+                <h3 className="text-base font-display font-bold text-[#101536] dark:text-white">
+                  {lang === 'bn' ? 'পেমেন্ট ভেরিফিকেশন কিউ' : 'Payment Verification Queue'}
+                </h3>
+                <p className="text-xs text-[#7C8499]">
+                  {lang === 'bn'
+                    ? 'Pending, Approved ও Rejected পেমেন্ট যাচাই করুন। Reject করলে কারণ লিখতে হবে।'
+                    : 'Review Pending, Approved, and Rejected requests. Rejection requires a reason visible to the user.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
                 {(['all', 'pending', 'approved', 'rejected'] as const).map((f) => (
                   <button
                     key={f}
                     type="button"
                     onClick={() => setPayFilter(f)}
-                    className={`px-3 py-1 rounded-lg text-xs font-semibold capitalize ${
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold capitalize inline-flex items-center gap-1.5 ${
                       payFilter === f ? 'bg-[#5B35F5] text-white' : 'bg-[#F3F0FF] dark:bg-slate-800 text-[#7C8499]'
                     }`}
                   >
-                    {f}
+                    <span>{f}</span>
+                    <span className="px-1.5 py-0.5 rounded-md bg-black/10 dark:bg-white/10 text-[10px] tabular-nums">
+                      {paymentCounts[f]}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -679,68 +1132,111 @@ export const PlatformSettingsView: React.FC<{
                     <tr>
                       <th className="py-2.5 px-3">Date</th>
                       <th className="py-2.5 px-3">Business</th>
-                      <th className="py-2.5 px-3">For / Gateway</th>
-                      <th className="py-2.5 px-3">TrxID</th>
+                      <th className="py-2.5 px-3">Package / Method</th>
+                      <th className="py-2.5 px-3">TrxID &amp; Numbers</th>
                       <th className="py-2.5 px-3">Amount</th>
-                      <th className="py-2.5 px-3">Status</th>
+                      <th className="py-2.5 px-3">Status &amp; Note</th>
                       <th className="py-2.5 px-3 text-right">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E6E0FF]/50 dark:divide-slate-800">
                     {filteredPayments.map((p) => {
                       const bizName = String((p.business as Record<string, unknown>)?.name || p.business_id);
+                      const gwMeta = (p.gateway_response && typeof p.gateway_response === 'object'
+                        ? p.gateway_response
+                        : {}) as Record<string, unknown>;
+                      const paidTo = gwMeta.paid_to_number ? String(gwMeta.paid_to_number) : '';
+                      const targetTitle = gwMeta.target_title
+                        ? String(gwMeta.target_title)
+                        : String(p.payment_for || '').replace('_', ' ');
+                      const senderNumber = p.sender_number ? String(p.sender_number) : '';
+                      const adminNotes = p.admin_notes ? String(p.admin_notes) : '';
                       return (
-                        <tr key={String(p.id)}>
-                          <td className="py-3 px-3 font-mono text-[11px] text-[#7C8499]">
+                        <tr key={String(p.id)} className="align-top">
+                          <td className="py-3 px-3 font-mono text-[11px] text-[#7C8499] whitespace-nowrap">
                             {new Date(String(p.created_at)).toLocaleDateString()}
                           </td>
                           <td className="py-3 px-3 font-semibold text-[#101536] dark:text-white">{bizName}</td>
                           <td className="py-3 px-3">
-                            <span className="capitalize">{String(p.payment_for).replace('_', ' ')}</span> ·{' '}
-                            {String(p.gateway_slug)}
+                            <div className="font-semibold text-[#101536] dark:text-white">{targetTitle}</div>
+                            <div className="text-[11px] text-[#7C8499] uppercase font-semibold">
+                              {String(p.gateway_slug)}
+                            </div>
                           </td>
-                          <td className="py-3 px-3 font-mono text-[11px]">
-                            {String(p.transaction_id || '—')}
-                            {p.sender_number ? ` (${String(p.sender_number)})` : ''}
+                          <td className="py-3 px-3 font-mono text-[11px] space-y-0.5">
+                            <div className="font-bold text-[#101536] dark:text-white">{String(p.transaction_id || '—')}</div>
+                            {senderNumber && (
+                              <div className="text-[#7C8499]">From: {senderNumber}</div>
+                            )}
+                            {paidTo && <div className="text-[#5B35F5] dark:text-[#A78BFA]">To: {paidTo}</div>}
                           </td>
-                          <td className="py-3 px-3 font-bold tabular-nums">{formatMoney(Number(p.amount || 0))}</td>
-                          <td className="py-3 px-3">
+                          <td className="py-3 px-3 font-bold tabular-nums whitespace-nowrap">
+                            {formatMoney(Number(p.amount || 0))}
+                          </td>
+                          <td className="py-3 px-3 space-y-1 max-w-[220px]">
                             <StatusBadge status={String(p.status)} />
+                            {adminNotes && (
+                              <div
+                                className={`text-[11px] ${
+                                  p.status === 'rejected' ? 'text-rose-600 dark:text-rose-400 font-medium' : 'text-[#7C8499]'
+                                }`}
+                              >
+                                {adminNotes}
+                              </div>
+                            )}
                           </td>
-                          <td className="py-3 px-3 text-right">
+                          <td className="py-3 px-3 text-right whitespace-nowrap">
                             {p.status === 'pending' ? (
                               <div className="inline-flex gap-1.5">
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    setReviewConfirm({
+                                  onClick={() => {
+                                    setReviewNotes('');
+                                    setReviewError('');
+                                    setReviewModal({
                                       id: String(p.id),
                                       decision: 'approved',
                                       amount: Number(p.amount || 0),
+                                      currency: String(p.currency || 'BDT'),
                                       bizName,
-                                    })
-                                  }
+                                      trxId: String(p.transaction_id || ''),
+                                      senderNumber: String(p.sender_number || ''),
+                                      paidToNumber: paidTo,
+                                      gatewaySlug: String(p.gateway_slug || ''),
+                                      targetTitle,
+                                    });
+                                  }}
                                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#16B66A] text-white font-semibold"
                                 >
                                   <CheckCircle2 className="w-3.5 h-3.5" /> Approve
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    setReviewConfirm({
+                                  onClick={() => {
+                                    setReviewNotes('');
+                                    setReviewError('');
+                                    setReviewModal({
                                       id: String(p.id),
                                       decision: 'rejected',
                                       amount: Number(p.amount || 0),
+                                      currency: String(p.currency || 'BDT'),
                                       bizName,
-                                    })
-                                  }
+                                      trxId: String(p.transaction_id || ''),
+                                      senderNumber: String(p.sender_number || ''),
+                                      paidToNumber: paidTo,
+                                      gatewaySlug: String(p.gateway_slug || ''),
+                                      targetTitle,
+                                    });
+                                  }}
                                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#EF4444] text-white font-semibold"
                                 >
                                   <XCircle className="w-3.5 h-3.5" /> Reject
                                 </button>
                               </div>
                             ) : (
-                              <span className="text-[11px] text-[#7C8499]">Reviewed</span>
+                              <span className="text-[11px] text-[#7C8499]">
+                                {p.reviewed_at ? new Date(String(p.reviewed_at)).toLocaleDateString() : 'Reviewed'}
+                              </span>
                             )}
                           </td>
                         </tr>
@@ -987,33 +1483,270 @@ export const PlatformSettingsView: React.FC<{
         )}
       </AdminModal>
 
-      <ConfirmDialog
-        open={Boolean(reviewConfirm)}
-        title={`${reviewConfirm?.decision === 'approved' ? 'Approve' : 'Reject'} Payment?`}
-        message={
-          reviewConfirm?.decision === 'approved'
-            ? `Approve ${formatMoney(reviewConfirm.amount)} from ${reviewConfirm.bizName}? Coins or subscription will be credited atomically.`
-            : `Reject payment from ${reviewConfirm?.bizName}?`
+      {/* Add / Edit Manual Payment Number Modal */}
+      <AdminModal
+        open={mfsAccountModalOpen}
+        title={
+          mfsEditingAccountId
+            ? lang === 'bn'
+              ? `${activeMfsMethod.toUpperCase()} নম্বর এডিট করুন`
+              : `Edit ${activeMfsMethod.toUpperCase()} Number`
+            : lang === 'bn'
+            ? `নতুন ${activeMfsMethod.toUpperCase()} নম্বর যোগ করুন`
+            : `Add ${activeMfsMethod.toUpperCase()} Number`
         }
-        tone={reviewConfirm?.decision === 'approved' ? 'primary' : 'danger'}
-        confirmLabel={adminT(lang, 'confirm')}
-        cancelLabel={adminT(lang, 'cancel')}
-        onCancel={() => setReviewConfirm(null)}
-        onConfirm={async () => {
-          if (!reviewConfirm) return;
-          try {
-            await apiFetch(`/api/admin/payments/${reviewConfirm.id}/review`, {
-              method: 'POST',
-              body: JSON.stringify({ decision: reviewConfirm.decision }),
-            });
-            onNotify(`Payment ${reviewConfirm.decision}.`);
-            setReviewConfirm(null);
-            await loadSubTab('payments');
-          } catch (err) {
-            onError(err instanceof Error ? err.message : 'Failed to review payment.');
-          }
+        subtitle={
+          activeMfsMethod === 'bkash'
+            ? `${activeMfsAccounts.length} / 9 numbers configured`
+            : `${activeMfsAccounts.length} numbers configured`
+        }
+        onClose={() => setMfsAccountModalOpen(false)}
+        maxWidthClass="max-w-md"
+      >
+        <form onSubmit={handleSaveMfsAccount} className="space-y-3 text-xs">
+          <div>
+            <label className="block font-semibold mb-1">
+              {lang === 'bn' ? 'মোবাইল / মার্চেন্ট নম্বর *' : 'Mobile / Payment Number *'}
+            </label>
+            <input
+              type="text"
+              required
+              placeholder="01XXXXXXXXX"
+              value={mfsAccountForm.number}
+              onChange={(e) => setMfsAccountForm((prev) => ({ ...prev, number: e.target.value }))}
+              className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 font-mono"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block font-semibold mb-1">{lang === 'bn' ? 'অ্যাকাউন্ট টাইপ' : 'Account Type'}</label>
+              <select
+                value={mfsAccountForm.account_type}
+                onChange={(e) => setMfsAccountForm((prev) => ({ ...prev, account_type: e.target.value }))}
+                className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
+              >
+                <option value="Personal">Personal (Send Money)</option>
+                <option value="Merchant">Merchant (Payment)</option>
+                <option value="Agent">Agent</option>
+              </select>
+            </div>
+            <div>
+              <label className="block font-semibold mb-1">{lang === 'bn' ? 'লেবেল / নাম (ঐচ্ছিক)' : 'Label (Optional)'}</label>
+              <input
+                type="text"
+                placeholder="e.g. Primary #1"
+                value={mfsAccountForm.label}
+                onChange={(e) => setMfsAccountForm((prev) => ({ ...prev, label: e.target.value }))}
+                className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block font-semibold mb-1">
+              {lang === 'bn' ? 'এই নম্বরের আলাদা নির্দেশনা (ঐচ্ছিক)' : 'Per-Number Note / Instruction (Optional)'}
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. Send Money only (Reference: Business Name)"
+              value={mfsAccountForm.instructions}
+              onChange={(e) => setMfsAccountForm((prev) => ({ ...prev, instructions: e.target.value }))}
+              className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
+            />
+          </div>
+          <label className="flex items-center gap-2 font-semibold pt-1">
+            <input
+              type="checkbox"
+              checked={mfsAccountForm.is_active}
+              onChange={(e) => setMfsAccountForm((prev) => ({ ...prev, is_active: e.target.checked }))}
+            />
+            <span>{adminT(lang, 'active')}</span>
+          </label>
+          <div className="flex justify-end gap-2 pt-2 border-t border-[#E6E0FF]/70 dark:border-slate-800">
+            <button
+              type="button"
+              onClick={() => setMfsAccountModalOpen(false)}
+              className="px-4 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 font-semibold"
+            >
+              {adminT(lang, 'cancel')}
+            </button>
+            <button
+              type="submit"
+              disabled={mfsSaving}
+              className="px-4 py-2 rounded-xl bg-[#5B35F5] hover:bg-[#4520D9] text-white font-semibold disabled:opacity-60"
+            >
+              {mfsSaving ? '...' : adminT(lang, 'saveChanges')}
+            </button>
+          </div>
+        </form>
+      </AdminModal>
+
+      {/* Approve / Reject Payment Verification Modal */}
+      <AdminModal
+        open={Boolean(reviewModal)}
+        title={
+          reviewModal?.decision === 'approved'
+            ? lang === 'bn'
+              ? 'পেমেন্ট অনুমোদন করুন (Approve)'
+              : 'Approve Manual Payment'
+            : lang === 'bn'
+            ? 'পেমেন্ট বাতিল করুন (Reject)'
+            : 'Reject Manual Payment'
+        }
+        subtitle={reviewModal ? `${reviewModal.bizName} · ${reviewModal.targetTitle}` : undefined}
+        onClose={() => {
+          setReviewModal(null);
+          setReviewError('');
         }}
-      />
+        maxWidthClass="max-w-md"
+      >
+        {reviewModal && (
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setReviewError('');
+              if (reviewModal.decision === 'rejected' && reviewNotes.trim().length < 3) {
+                setReviewError(
+                  lang === 'bn'
+                    ? 'পেমেন্ট Reject করতে হলে অবশ্যই অন্তত ৩ অক্ষরের কারণ লিখতে হবে।'
+                    : 'Please enter a clear rejection reason (at least 3 characters).'
+                );
+                return;
+              }
+              setReviewLoading(true);
+              try {
+                await apiFetch(`/api/admin/payments/${reviewModal.id}/review`, {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    decision: reviewModal.decision,
+                    admin_notes: reviewNotes.trim(),
+                  }),
+                });
+                onNotify(`Payment ${reviewModal.decision}.`);
+                setReviewModal(null);
+                setReviewNotes('');
+                await loadSubTab('payments');
+              } catch (err) {
+                setReviewError(err instanceof Error ? err.message : 'Failed to review payment.');
+              } finally {
+                setReviewLoading(false);
+              }
+            }}
+            className="space-y-4 text-xs"
+          >
+            <div className="p-3.5 rounded-xl bg-[#F8F9FC] dark:bg-slate-950 border border-[#E6E0FF] dark:border-slate-800 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-[#7C8499]">Amount:</span>
+                <span className="font-bold tabular-nums text-[#101536] dark:text-white">
+                  {formatMoney(reviewModal.amount)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#7C8499]">Method:</span>
+                <span className="font-semibold uppercase text-[#101536] dark:text-white">{reviewModal.gatewaySlug}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#7C8499]">TrxID:</span>
+                <span className="font-mono font-bold text-[#5B35F5] dark:text-[#A78BFA]">{reviewModal.trxId}</span>
+              </div>
+              {reviewModal.senderNumber && (
+                <div className="flex justify-between">
+                  <span className="text-[#7C8499]">Sender:</span>
+                  <span className="font-mono">{reviewModal.senderNumber}</span>
+                </div>
+              )}
+              {reviewModal.paidToNumber && (
+                <div className="flex justify-between">
+                  <span className="text-[#7C8499]">Paid To:</span>
+                  <span className="font-mono">{reviewModal.paidToNumber}</span>
+                </div>
+              )}
+            </div>
+
+            {reviewModal.decision === 'approved' ? (
+              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/50 text-emerald-800 dark:text-emerald-300">
+                {lang === 'bn'
+                  ? 'Approve করলে সংশ্লিষ্ট কয়েন প্যাকেজ বা সাবস্ক্রিপশন স্বয়ংক্রিয়ভাবে যুক্ত হবে এবং ইউজারকে নোটিফিকেশন পাঠানো হবে।'
+                  : 'Approving will atomically credit the Coin Package or activate the Subscription Plan and notify the merchant.'}
+              </div>
+            ) : (
+              <div>
+                <label className="block font-semibold text-rose-600 dark:text-rose-400 mb-1">
+                  {lang === 'bn' ? 'বাতিলের কারণ (ইউজার দেখতে পাবে) *' : 'Rejection Reason (Visible to User) *'}
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  value={reviewNotes}
+                  onChange={(e) => setReviewNotes(e.target.value)}
+                  placeholder={
+                    lang === 'bn'
+                      ? 'যেমন: TrxID পাওয়া যায়নি বা পাঠানো টাকার পরিমাণ কম ছিল।'
+                      : 'e.g. Transaction ID not found or amount mismatch.'
+                  }
+                  className="w-full px-3 py-2 rounded-xl border border-rose-200 dark:border-rose-900/60 bg-white dark:bg-slate-950"
+                />
+              </div>
+            )}
+
+            {reviewModal.decision === 'approved' && (
+              <div>
+                <label className="block font-semibold mb-1">
+                  {lang === 'bn' ? 'অ্যাডমিন নোট (ঐচ্ছিক)' : 'Admin Note (Optional)'}
+                </label>
+                <input
+                  type="text"
+                  value={reviewNotes}
+                  onChange={(e) => setReviewNotes(e.target.value)}
+                  placeholder="Optional verification remark"
+                  className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
+                />
+              </div>
+            )}
+
+            {reviewError && (
+              <div className="p-2.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-rose-700 dark:text-rose-300">
+                {reviewError}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-[#E6E0FF]/70 dark:border-slate-800">
+              <button
+                type="button"
+                disabled={reviewLoading}
+                onClick={() => {
+                  setReviewModal(null);
+                  setReviewError('');
+                }}
+                className="px-4 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 font-semibold"
+              >
+                {adminT(lang, 'cancel')}
+              </button>
+              <button
+                type="submit"
+                disabled={reviewLoading}
+                className={`px-4 py-2 rounded-xl text-white font-semibold disabled:opacity-60 inline-flex items-center gap-1.5 ${
+                  reviewModal.decision === 'approved'
+                    ? 'bg-[#16B66A] hover:bg-emerald-600'
+                    : 'bg-[#EF4444] hover:bg-rose-600'
+                }`}
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>
+                  {reviewLoading
+                    ? '...'
+                    : reviewModal.decision === 'approved'
+                    ? lang === 'bn'
+                      ? 'Confirm Approve'
+                      : 'Confirm Approve'
+                    : lang === 'bn'
+                    ? 'Confirm Reject'
+                    : 'Confirm Reject'}
+                </span>
+              </button>
+            </div>
+          </form>
+        )}
+      </AdminModal>
 
       {/* Add / Edit Payment Gateway Modal */}
       <AdminModal
@@ -1090,8 +1823,9 @@ export const PlatformSettingsView: React.FC<{
               >
                 <option value="bkash">bKash</option>
                 <option value="nagad">Nagad</option>
+                <option value="rocket">Rocket</option>
                 <option value="sslcommerz">SSLCommerz</option>
-                <option value="manual">Manual / Bank / Rocket / Upay</option>
+                <option value="manual">Manual / Bank / Upay</option>
                 <option value="custom">Custom Gateway</option>
               </select>
             </div>

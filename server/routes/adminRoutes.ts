@@ -5,6 +5,16 @@ import { checkSchemaStatus } from '../db/migrator.ts';
 import { createNotification, writeAuditLog } from '../db/repository.ts';
 import { requireAuth, requireSuperAdmin, type AuthedRequest } from '../middleware/auth.ts';
 import { getMetaOAuthRedirectUri, resolveAppBaseUrl } from '../services/metaService.ts';
+import {
+  ALLOWED_GATEWAY_TYPES,
+  buildEncryptedCredentials,
+  GATEWAY_SLUG_REGEX,
+  ManualPaymentError,
+  reviewManualPayment,
+  sanitizeGatewayConfigPublic,
+  toSafeGatewayRow,
+  upsertManualGatewayAccounts,
+} from '../services/manualPaymentService.ts';
 
 const router = Router();
 router.use(requireAuth, requireSuperAdmin);
@@ -859,49 +869,7 @@ router.patch('/features/:key', async (req: AuthedRequest, res) => {
   return res.json({ feature: data });
 });
 
-// Payment Gateways & Payment Review
-const ALLOWED_GATEWAY_TYPES = new Set(['manual', 'bkash', 'nagad', 'sslcommerz', 'custom']);
-const GATEWAY_SLUG_REGEX = /^[a-z0-9][a-z0-9_-]{1,48}$/;
-
-function sanitizeGatewayConfigPublic(raw: unknown): Record<string, string> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  const obj = raw as Record<string, unknown>;
-  const safe: Record<string, string> = {};
-  const allowedKeys = ['account_number', 'account_type', 'merchant_id', 'bank_name', 'routing_number', 'display_note'];
-  for (const key of allowedKeys) {
-    if (typeof obj[key] === 'string' && obj[key].trim()) {
-      safe[key] = obj[key].trim().slice(0, 200);
-    }
-  }
-  return safe;
-}
-
-function sanitizeGatewayCredentials(raw: unknown): Record<string, string> | null {
-  if (!raw) return null;
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    return trimmed ? { api_token: trimmed } : null;
-  }
-  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const obj = raw as Record<string, unknown>;
-  const cleaned: Record<string, string> = {};
-  const allowedCredKeys = ['merchant_id', 'api_key', 'api_secret', 'username', 'password', 'webhook_secret'];
-  for (const key of allowedCredKeys) {
-    if (typeof obj[key] === 'string' && obj[key].trim()) {
-      cleaned[key] = obj[key].trim();
-    }
-  }
-  return Object.keys(cleaned).length > 0 ? cleaned : null;
-}
-
-function toSafeGatewayRow(row: Record<string, unknown>) {
-  const { credentials_encrypted, ...rest } = row;
-  return {
-    ...rest,
-    has_credentials: Boolean(typeof credentials_encrypted === 'string' && credentials_encrypted.trim().length > 0),
-  };
-}
-
+// Payment Gateways & Manual Payment Review
 router.get('/payments', async (_req, res) => {
   const admin = getSupabaseAdmin();
   const [{ data: gateways }, { data: payments }] = await Promise.all([
@@ -909,12 +877,37 @@ router.get('/payments', async (_req, res) => {
       .from('payment_gateways')
       .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at')
       .order('slug'),
-    admin.from('payments').select('*, business:businesses(id, name, email)').order('created_at', { ascending: false }).limit(150),
+    admin.from('payments').select('*, business:businesses(id, name, email)').order('created_at', { ascending: false }).limit(200),
   ]);
   return res.json({
     gateways: (gateways || []).map((g) => toSafeGatewayRow(g as Record<string, unknown>)),
     payments: payments || [],
   });
+});
+
+router.put('/manual-payment-methods/:method', async (req: AuthedRequest, res) => {
+  try {
+    const method = String(req.params.method || '').trim().toLowerCase();
+    if (method !== 'bkash' && method !== 'nagad' && method !== 'rocket') {
+      return res.status(400).json({ error: 'Method must be bkash, nagad, or rocket.' });
+    }
+    const { accounts, is_active, instructions, name } = req.body as {
+      accounts?: unknown[];
+      is_active?: boolean;
+      instructions?: string;
+      name?: string;
+    };
+
+    const gateway = await upsertManualGatewayAccounts(
+      method,
+      { accounts, is_active, instructions, name },
+      { id: req.user!.id, email: req.user!.email, role: req.user!.role, ip: req.ip }
+    );
+    return res.json({ gateway });
+  } catch (err) {
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Failed to update manual payment method.' });
+  }
 });
 
 router.post('/payment-gateways', async (req: AuthedRequest, res) => {
@@ -928,7 +921,7 @@ router.post('/payment-gateways', async (req: AuthedRequest, res) => {
       .replace(/[^a-z0-9_-]+/g, '_')
       .replace(/^_+|_+$/g, '')
       .slice(0, 48);
-    const gateway_type = typeof body.gateway_type === 'string' ? body.gateway_type.trim() : 'manual';
+    const gateway_type = typeof body.gateway_type === 'string' ? body.gateway_type.trim().toLowerCase() : 'manual';
 
     if (name.length < 2 || name.length > 100) {
       return res.status(400).json({ error: 'Gateway name must be between 2 and 100 characters.' });
@@ -937,7 +930,7 @@ router.post('/payment-gateways', async (req: AuthedRequest, res) => {
       return res.status(400).json({ error: 'Gateway slug must be 2–49 lowercase letters, numbers, hyphens, or underscores.' });
     }
     if (!ALLOWED_GATEWAY_TYPES.has(gateway_type)) {
-      return res.status(400).json({ error: 'Invalid gateway_type. Allowed: manual, bkash, nagad, sslcommerz, custom.' });
+      return res.status(400).json({ error: 'Invalid gateway_type. Allowed: manual, bkash, nagad, rocket, sslcommerz, custom.' });
     }
 
     const { data: existing } = await admin.from('payment_gateways').select('id').eq('slug', slug).maybeSingle();
@@ -945,27 +938,43 @@ router.post('/payment-gateways', async (req: AuthedRequest, res) => {
       return res.status(409).json({ error: `A payment gateway with slug "${slug}" already exists.` });
     }
 
-    const config_public = sanitizeGatewayConfigPublic(body.config_public);
-    const parsedCredentials = sanitizeGatewayCredentials(body.credentials);
+    const config_public = sanitizeGatewayConfigPublic(
+      {
+        ...(body.config_public && typeof body.config_public === 'object' ? (body.config_public as Record<string, unknown>) : {}),
+        ...(gateway_type === 'rocket' ? { manual_method: 'rocket' } : {}),
+      },
+      gateway_type || slug
+    );
+    const credentials_encrypted = buildEncryptedCredentials(body.credentials);
     const instructions = typeof body.instructions === 'string' ? body.instructions.trim().slice(0, 1000) : '';
 
-    const { data, error } = await admin
+    const insertPayload = {
+      slug,
+      name,
+      gateway_type,
+      is_active: body.is_active !== false,
+      is_sandbox: body.is_sandbox === true,
+      config_public,
+      credentials_encrypted,
+      instructions,
+      updated_at: new Date().toISOString(),
+    };
+
+    let result = await admin
       .from('payment_gateways')
-      .insert({
-        slug,
-        name,
-        gateway_type,
-        is_active: body.is_active !== false,
-        is_sandbox: body.is_sandbox !== false,
-        config_public,
-        credentials_encrypted: parsedCredentials ? encryptSecret(JSON.stringify(parsedCredentials)) : '',
-        instructions,
-        updated_at: new Date().toISOString(),
-      })
+      .insert(insertPayload)
       .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at')
       .single();
 
-    if (error) return res.status(400).json({ error: error.message });
+    if (result.error && gateway_type === 'rocket' && result.error.message.toLowerCase().includes('gateway_type')) {
+      result = await admin
+        .from('payment_gateways')
+        .insert({ ...insertPayload, gateway_type: 'manual' })
+        .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at')
+        .single();
+    }
+
+    if (result.error) return res.status(400).json({ error: result.error.message });
 
     await writeAuditLog({
       actorId: req.user!.id,
@@ -974,13 +983,14 @@ router.post('/payment-gateways', async (req: AuthedRequest, res) => {
       action: 'payment_gateway_created',
       targetType: 'payment_gateway',
       targetId: slug,
-      details: { name, gateway_type, is_active: body.is_active !== false, is_sandbox: body.is_sandbox !== false },
+      details: { name, gateway_type, is_active: body.is_active !== false, is_sandbox: body.is_sandbox === true },
       ipAddress: req.ip,
     });
 
-    return res.status(201).json({ gateway: toSafeGatewayRow(data as Record<string, unknown>) });
+    return res.status(201).json({ gateway: toSafeGatewayRow(result.data as Record<string, unknown>) });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create payment gateway.' });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Failed to create payment gateway.' });
   }
 });
 
@@ -998,6 +1008,20 @@ router.patch('/payment-gateways/:slug', async (req: AuthedRequest, res) => {
       instructions,
     } = req.body as Record<string, unknown>;
 
+    const { data: existingGw } = await admin
+      .from('payment_gateways')
+      .select('slug, gateway_type, config_public')
+      .eq('slug', req.params.slug)
+      .maybeSingle();
+
+    if (!existingGw) {
+      return res.status(404).json({ error: 'Payment gateway not found.' });
+    }
+
+    const effectiveType = typeof gateway_type === 'string'
+      ? gateway_type.trim().toLowerCase()
+      : String(existingGw.gateway_type || req.params.slug);
+
     const payload: Record<string, unknown> = {
       updated_at: new Date().toISOString(),
     };
@@ -1010,34 +1034,52 @@ router.patch('/payment-gateways/:slug', async (req: AuthedRequest, res) => {
       payload.name = trimmed;
     }
     if (typeof gateway_type === 'string') {
-      if (!ALLOWED_GATEWAY_TYPES.has(gateway_type)) {
+      const normalizedType = gateway_type.trim().toLowerCase();
+      if (!ALLOWED_GATEWAY_TYPES.has(normalizedType)) {
         return res.status(400).json({ error: 'Invalid gateway_type.' });
       }
-      payload.gateway_type = gateway_type;
+      payload.gateway_type = normalizedType;
     }
     if (typeof is_active === 'boolean') payload.is_active = is_active;
     if (typeof is_sandbox === 'boolean') payload.is_sandbox = is_sandbox;
-    if (config_public !== undefined) payload.config_public = sanitizeGatewayConfigPublic(config_public);
+    if (config_public !== undefined) {
+      payload.config_public = sanitizeGatewayConfigPublic(
+        {
+          ...(config_public && typeof config_public === 'object' ? (config_public as Record<string, unknown>) : {}),
+          ...(effectiveType === 'rocket' ? { manual_method: 'rocket' } : {}),
+        },
+        effectiveType
+      );
+    }
     if (typeof instructions === 'string') payload.instructions = instructions.trim().slice(0, 1000);
 
     let credentialsUpdated = false;
-    const parsedCredentials = sanitizeGatewayCredentials(credentials);
+    const encryptedCreds = buildEncryptedCredentials(credentials);
     if (clear_credentials === true) {
       payload.credentials_encrypted = '';
       credentialsUpdated = true;
-    } else if (parsedCredentials) {
-      payload.credentials_encrypted = encryptSecret(JSON.stringify(parsedCredentials));
+    } else if (encryptedCreds) {
+      payload.credentials_encrypted = encryptedCreds;
       credentialsUpdated = true;
     }
 
-    const { data, error } = await admin
+    let result = await admin
       .from('payment_gateways')
       .update(payload)
       .eq('slug', req.params.slug)
       .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at')
       .single();
 
-    if (error) return res.status(400).json({ error: error.message });
+    if (result.error && payload.gateway_type === 'rocket' && result.error.message.toLowerCase().includes('gateway_type')) {
+      result = await admin
+        .from('payment_gateways')
+        .update({ ...payload, gateway_type: 'manual' })
+        .eq('slug', req.params.slug)
+        .select('id, slug, name, gateway_type, is_active, is_sandbox, config_public, credentials_encrypted, instructions, updated_at')
+        .single();
+    }
+
+    if (result.error) return res.status(400).json({ error: result.error.message });
 
     await writeAuditLog({
       actorId: req.user!.id,
@@ -1050,9 +1092,10 @@ router.patch('/payment-gateways/:slug', async (req: AuthedRequest, res) => {
       ipAddress: req.ip,
     });
 
-    return res.json({ gateway: toSafeGatewayRow(data as Record<string, unknown>) });
+    return res.json({ gateway: toSafeGatewayRow(result.data as Record<string, unknown>) });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update payment gateway.' });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Failed to update payment gateway.' });
   }
 });
 
@@ -1060,8 +1103,8 @@ router.delete('/payment-gateways/:slug', async (req: AuthedRequest, res) => {
   try {
     const admin = getSupabaseAdmin();
     const slug = req.params.slug;
-    if (slug === 'manual') {
-      return res.status(400).json({ error: 'The default manual gateway cannot be deleted. You can disable it instead.' });
+    if (slug === 'manual' || slug === 'bkash' || slug === 'nagad' || slug === 'rocket') {
+      return res.status(400).json({ error: 'Built-in payment methods cannot be deleted. You can disable them instead.' });
     }
 
     const { count } = await admin
@@ -1096,94 +1139,22 @@ router.delete('/payment-gateways/:slug', async (req: AuthedRequest, res) => {
 
 router.post('/payments/:paymentId/review', async (req: AuthedRequest, res) => {
   try {
-    const admin = getSupabaseAdmin();
-    const { decision, admin_notes } = req.body as { decision: 'approved' | 'rejected' | 'refunded'; admin_notes?: string };
-    const { data: payment } = await admin.from('payments').select('*').eq('id', req.params.paymentId).maybeSingle();
-    if (!payment) return res.status(404).json({ error: 'Payment not found.' });
-
-    if (payment.status === 'approved' && decision === 'approved') {
-      return res.status(400).json({ error: 'Payment is already approved.' });
-    }
-
-    if (decision === 'approved') {
-      if (payment.payment_for === 'coin_package' && payment.reference_id) {
-        const { data: pkg } = await admin.from('coin_packages').select('*').eq('id', payment.reference_id).maybeSingle();
-        if (pkg) {
-          const totalCoins = Number(pkg.coin_amount) + Number(pkg.bonus_coins || 0);
-          await admin.rpc('credit_ai_coins_atomic', {
-            p_business_id: payment.business_id,
-            p_amount: totalCoins,
-            p_type: 'purchase',
-            p_description: `Purchased ${pkg.name} (${totalCoins} coins)`,
-            p_reference_id: payment.id,
-            p_user_id: req.user!.id,
-          });
-          await admin.from('package_purchases').insert({
-            business_id: payment.business_id,
-            user_id: payment.user_id,
-            package_id: pkg.id,
-            coins_granted: totalCoins,
-            amount: payment.amount,
-            currency: payment.currency,
-            payment_id: payment.id,
-            status: 'completed',
-          });
-        }
-      } else if (payment.payment_for === 'subscription' && payment.reference_id) {
-        const { data: plan } = await admin.from('subscription_plans').select('*').eq('id', payment.reference_id).maybeSingle();
-        if (plan) {
-          const expiresAt = new Date(Date.now() + Number(plan.duration_days || 30) * 86400000).toISOString();
-          await admin
-            .from('businesses')
-            .update({
-              subscription_plan_id: plan.id,
-              subscription_status: 'active',
-              subscription_expires_at: expiresAt,
-            })
-            .eq('id', payment.business_id);
-          if (plan.coin_allocation > 0) {
-            await admin.rpc('credit_ai_coins_atomic', {
-              p_business_id: payment.business_id,
-              p_amount: plan.coin_allocation,
-              p_type: 'subscription_grant',
-              p_description: `${plan.name} subscription coin allocation`,
-              p_reference_id: payment.id,
-              p_user_id: req.user!.id,
-            });
-          }
-        }
-      }
-    }
-
-    const { data: updated, error } = await admin
-      .from('payments')
-      .update({
-        status: decision,
-        admin_notes: admin_notes || '',
-        reviewed_by: req.user!.id,
-        reviewed_at: new Date().toISOString(),
-      })
-      .eq('id', payment.id)
-      .select('*')
-      .single();
-
-    if (error) return res.status(400).json({ error: error.message });
-
-    await writeAuditLog({
-      actorId: req.user!.id,
-      actorEmail: req.user!.email,
-      actorRole: req.user!.role,
-      businessId: payment.business_id,
-      action: `payment_${decision}`,
-      targetType: 'payment',
-      targetId: payment.id,
-      details: { amount: payment.amount, payment_for: payment.payment_for },
-      ipAddress: req.ip,
+    const { decision, admin_notes } = req.body as { decision: 'approved' | 'rejected'; admin_notes?: string };
+    const updated = await reviewManualPayment({
+      paymentId: req.params.paymentId,
+      decision,
+      adminNotes: admin_notes,
+      adminUser: {
+        id: req.user!.id,
+        email: req.user!.email,
+        role: req.user!.role,
+        ip: req.ip,
+      },
     });
-
     return res.json({ payment: updated });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : 'Payment review failed.' });
+    const status = err instanceof ManualPaymentError ? err.statusCode : 500;
+    return res.status(status).json({ error: err instanceof Error ? err.message : 'Payment review failed.' });
   }
 });
 

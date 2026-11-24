@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Loader2, Lock, Mail, Moon, Sun, User } from 'lucide-react';
+import { Eye, EyeOff, Loader2, Lock, Mail, Moon, Sun, User } from 'lucide-react';
 import { getBrowserSupabase } from '../../lib/supabaseClient';
 import type { AppSettings } from '../../types';
 import type { Lang } from '../../i18n/translations';
@@ -13,6 +13,7 @@ interface AuthScreenProps {
   onToggleDark: () => void;
   onAuthenticated: () => void;
   initialMode?: 'login' | 'register';
+  initialError?: string;
   onBackToHome?: () => void;
 }
 
@@ -24,15 +25,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   onToggleDark,
   onAuthenticated,
   initialMode = 'login',
+  initialError = '',
   onBackToHome,
 }) => {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot'>(initialMode);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [fullName, setFullName] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [googleRedirectUrl, setGoogleRedirectUrl] = useState<string | null>(null);
   const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialError);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -90,15 +95,46 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
 
   const handleGoogleSignIn = async () => {
     setError('');
+    setMessage('');
+    setGoogleRedirectUrl(null);
+    setGoogleLoading(true);
     try {
       const supabase = getBrowserSupabase();
-      const { error: oauthErr } = await supabase.auth.signInWithOAuth({
+      const inIframe = (() => {
+        try {
+          return window.self !== window.top;
+        } catch {
+          return true;
+        }
+      })();
+
+      const { data, error: oauthErr } = await supabase.auth.signInWithOAuth({
         provider: 'google',
-        options: { redirectTo: window.location.origin },
+        options: {
+          redirectTo: window.location.origin,
+          skipBrowserRedirect: inIframe,
+          queryParams: {
+            prompt: 'select_account',
+          },
+        },
       });
       if (oauthErr) throw oauthErr;
+      if (inIframe && data?.url) {
+        setGoogleRedirectUrl(data.url);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Google Sign-In failed.');
+      const raw = err instanceof Error ? err.message : 'Google Sign-In failed.';
+      if (raw.toLowerCase().includes('provider is not enabled') || raw.toLowerCase().includes('unsupported provider')) {
+        setError(
+          lang === 'bn'
+            ? 'Supabase Dashboard-এ Google Provider এখনো চালু করা হয়নি। Authentication -> Providers -> Google থেকে Client ID ও Secret যুক্ত করে Enable করুন।'
+            : 'Google Sign-In is not enabled in your Supabase project yet. Enable Google under Authentication -> Providers -> Google.'
+        );
+      } else {
+        setError(raw);
+      }
+    } finally {
+      setGoogleLoading(false);
     }
   };
 
@@ -230,16 +266,32 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
                 {lang === 'bn' ? 'পাসওয়ার্ড' : 'Password'}
               </label>
               <div className="relative">
-                <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
-                  type="password"
+                  type={showPassword ? 'text' : 'password'}
                   required
                   minLength={6}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
-                  className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  className="w-full pl-9 pr-10 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={
+                    showPassword
+                      ? lang === 'bn'
+                        ? 'পাসওয়ার্ড লুকান'
+                        : 'Hide password'
+                      : lang === 'bn'
+                      ? 'পাসওয়ার্ড দেখুন'
+                      : 'Show password'
+                  }
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors"
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
           )}
@@ -276,11 +328,52 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
 
             <button
               type="button"
+              disabled={googleLoading || loading}
               onClick={handleGoogleSignIn}
-              className="w-full py-2.5 px-4 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 hover:bg-slate-50 dark:hover:bg-slate-800 text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center justify-center gap-2 transition-colors"
+              className="w-full py-2.5 px-4 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 hover:bg-slate-50 dark:hover:bg-slate-800 text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center justify-center gap-2.5 transition-colors disabled:opacity-60"
             >
+              {googleLoading ? (
+                <Loader2 className="w-4 h-4 animate-spin text-slate-500" />
+              ) : (
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                  />
+                </svg>
+              )}
               <span>{lang === 'bn' ? 'Google দিয়ে চালিয়ে যান' : 'Continue with Google'}</span>
             </button>
+
+            {googleRedirectUrl && (
+              <div className="mt-3 rounded-xl border border-indigo-200 dark:border-indigo-900 bg-indigo-50 dark:bg-indigo-950/30 p-3 text-xs text-indigo-800 dark:text-indigo-200 flex flex-col gap-2">
+                <span>
+                  {lang === 'bn'
+                    ? 'প্রিভিউ ফ্রেমের ভেতর Google লগইন সরাসরি ওপেন হয় না। নিচের বাটনে ক্লিক করে নতুন ট্যাবে Google দিয়ে লগইন করুন:'
+                    : 'Google login requires a top-level tab outside the preview frame. Click below to continue:'}
+                </span>
+                <a
+                  href={googleRedirectUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700"
+                >
+                  {lang === 'bn' ? 'নতুন ট্যাবে Google লগইন খুলুন' : 'Open Google Sign-In in New Tab'}
+                </a>
+              </div>
+            )}
           </>
         )}
 
