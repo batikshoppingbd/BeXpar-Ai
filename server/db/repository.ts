@@ -53,6 +53,10 @@ export async function isFeatureEnabledForBusiness(businessId: string, featureKey
     return override.is_enabled;
   }
 
+  if (flag?.min_plan_slug === 'free') {
+    return true;
+  }
+
   const { data: biz } = await admin
     .from('businesses')
     .select('subscription_plan_id, subscription_plans(allowed_features)')

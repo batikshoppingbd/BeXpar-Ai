@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
 import { processCustomerMessageWithAi } from '../ai/customerAgent.ts';
 import { requireAuth, requireBusinessAccess, requireFeature, type AuthedRequest } from '../middleware/auth.ts';
-import { bookCourierParcel, refreshCourierTracking } from '../services/courierService.ts';
+import { bookCourierParcel, refreshCourierTracking, testCourierConnection } from '../services/courierService.ts';
 import {
   createMetaOAuthUrl,
   dispatchChannelReply,
@@ -466,7 +466,7 @@ router.get('/businesses/:businessId/capi', requireAuth, requireBusinessAccess('s
     const [{ data: config }, { data: events }] = await Promise.all([
       admin
         .from('meta_capi_configs')
-        .select('id, business_id, pixel_id, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required, updated_at')
+        .select('id, business_id, pixel_id, access_token_encrypted, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required, updated_at')
         .eq('business_id', req.businessId!)
         .maybeSingle(),
       admin
@@ -476,7 +476,22 @@ router.get('/businesses/:businessId/capi', requireAuth, requireBusinessAccess('s
         .order('created_at', { ascending: false })
         .limit(30),
     ]);
-    return res.json({ config, events: events || [] });
+    const safeConfig = config
+      ? {
+          id: config.id,
+          business_id: config.business_id,
+          pixel_id: config.pixel_id,
+          test_event_code: config.test_event_code,
+          is_active: config.is_active,
+          track_purchase: config.track_purchase,
+          track_lead: config.track_lead,
+          track_initiate_checkout: config.track_initiate_checkout,
+          consent_required: config.consent_required,
+          updated_at: config.updated_at,
+          has_access_token: Boolean(config.access_token_encrypted),
+        }
+      : null;
+    return res.json({ config: safeConfig, events: events || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to fetch CAPI config.' });
   }
@@ -490,13 +505,14 @@ router.put('/businesses/:businessId/capi', requireAuth, requireBusinessAccess('s
 
     const payload: Record<string, unknown> = {
       business_id: req.businessId!,
-      pixel_id: pixel_id || '',
-      test_event_code: test_event_code || '',
+      pixel_id: String(pixel_id || '').trim(),
+      test_event_code: String(test_event_code || '').trim(),
       is_active: Boolean(is_active),
       track_purchase: track_purchase !== false,
       track_lead: track_lead !== false,
       track_initiate_checkout: track_initiate_checkout !== false,
       consent_required: consent_required !== false,
+      updated_at: new Date().toISOString(),
     };
     if (access_token && String(access_token).trim()) {
       payload.access_token_encrypted = encryptSecret(String(access_token).trim());
@@ -505,17 +521,30 @@ router.put('/businesses/:businessId/capi', requireAuth, requireBusinessAccess('s
     const { data, error } = await admin
       .from('meta_capi_configs')
       .upsert(payload, { onConflict: 'business_id' })
-      .select('id, business_id, pixel_id, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required')
+      .select('id, business_id, pixel_id, access_token_encrypted, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required')
       .single();
 
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ config: data });
+    return res.json({
+      config: {
+        id: data.id,
+        business_id: data.business_id,
+        pixel_id: data.pixel_id,
+        test_event_code: data.test_event_code,
+        is_active: data.is_active,
+        track_purchase: data.track_purchase,
+        track_lead: data.track_lead,
+        track_initiate_checkout: data.track_initiate_checkout,
+        consent_required: data.consent_required,
+        has_access_token: Boolean(data.access_token_encrypted),
+      },
+    });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save CAPI settings.' });
   }
 });
 
-router.post('/businesses/:businessId/capi/test', requireAuth, requireBusinessAccess('settings'), async (req: AuthedRequest, res) => {
+router.post('/businesses/:businessId/capi/test', requireAuth, requireBusinessAccess('settings'), requireFeature('meta_capi'), async (req: AuthedRequest, res) => {
   try {
     const result = await sendMetaCapiEvent({
       businessId: req.businessId!,
@@ -523,6 +552,16 @@ router.post('/businesses/:businessId/capi/test', requireAuth, requireBusinessAcc
       eventId: `test_lead_${Date.now()}`,
       value: 100,
     });
+    if ('skipped' in result && result.skipped) {
+      return res.status(400).json({ error: result.reason });
+    }
+    if ('ok' in result && !result.ok) {
+      const apiMsg =
+        (result as { response?: { error?: { message?: string } }; error?: string }).response?.error?.message ||
+        (result as { error?: string }).error ||
+        'Meta CAPI event dispatch failed.';
+      return res.status(400).json({ error: apiMsg, ...result });
+    }
     return res.json(result);
   } catch (err) {
     return res.status(400).json({ error: err instanceof Error ? err.message : 'CAPI test failed.' });
@@ -536,7 +575,7 @@ router.get('/businesses/:businessId/couriers', requireAuth, requireBusinessAcces
     const [{ data: accounts }, { data: shipments }] = await Promise.all([
       admin
         .from('courier_accounts')
-        .select('id, provider, label, client_id, username, store_id, is_sandbox, is_active, updated_at')
+        .select('id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at')
         .eq('business_id', req.businessId!),
       admin
         .from('courier_shipments')
@@ -545,7 +584,22 @@ router.get('/businesses/:businessId/couriers', requireAuth, requireBusinessAcces
         .order('created_at', { ascending: false })
         .limit(50),
     ]);
-    return res.json({ accounts: accounts || [], shipments: shipments || [] });
+    const safeAccounts = (accounts || []).map((a) => ({
+      id: a.id,
+      provider: a.provider,
+      label: a.label,
+      client_id: a.client_id,
+      username: a.username,
+      store_id: a.store_id,
+      is_sandbox: a.is_sandbox,
+      is_active: a.is_active,
+      updated_at: a.updated_at,
+      has_api_key: Boolean(a.api_key_encrypted),
+      has_secret_key: Boolean(a.secret_key_encrypted),
+      has_client_secret: Boolean(a.client_secret_encrypted),
+      has_password: Boolean(a.password_encrypted),
+    }));
+    return res.json({ accounts: safeAccounts, shipments: shipments || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load couriers.' });
   }
@@ -557,35 +611,90 @@ router.put('/businesses/:businessId/couriers', requireAuth, requireBusinessAcces
     const { provider, label, api_key, secret_key, client_id, client_secret, username, password, store_id, is_sandbox, is_active } =
       req.body as Record<string, unknown>;
 
-    if (!provider || !['steadfast', 'pathao'].includes(String(provider))) {
+    const prov = String(provider || '').trim();
+    if (!['steadfast', 'pathao'].includes(prov)) {
       return res.status(400).json({ error: 'Valid courier provider (steadfast or pathao) is required.' });
+    }
+
+    const { data: existing } = await admin
+      .from('courier_accounts')
+      .select('id, api_key_encrypted, secret_key_encrypted, client_secret_encrypted, password_encrypted')
+      .eq('business_id', req.businessId!)
+      .eq('provider', prov)
+      .maybeSingle();
+
+    if (prov === 'steadfast') {
+      const hasKey = Boolean(String(api_key || '').trim() || existing?.api_key_encrypted);
+      const hasSec = Boolean(String(secret_key || '').trim() || existing?.secret_key_encrypted);
+      if (!hasKey || !hasSec) {
+        return res.status(400).json({ error: 'Steadfast Api-Key and Secret-Key are required.' });
+      }
+    } else {
+      const hasCid = Boolean(String(client_id || '').trim());
+      const hasCsec = Boolean(String(client_secret || '').trim() || existing?.client_secret_encrypted);
+      const hasUser = Boolean(String(username || '').trim());
+      const hasPass = Boolean(String(password || '').trim() || existing?.password_encrypted);
+      const hasStore = Boolean(String(store_id || '').trim());
+      if (!hasCid || !hasCsec || !hasUser || !hasPass || !hasStore) {
+        return res.status(400).json({ error: 'Pathao Client ID, Client Secret, Username, Password, and Store ID are required.' });
+      }
     }
 
     const payload: Record<string, unknown> = {
       business_id: req.businessId!,
-      provider,
-      label: label || String(provider).toUpperCase(),
+      provider: prov,
+      label: label ? String(label).trim() : prov.toUpperCase(),
       is_sandbox: Boolean(is_sandbox),
       is_active: is_active !== false,
+      updated_at: new Date().toISOString(),
     };
-    if (api_key) payload.api_key_encrypted = encryptSecret(String(api_key));
-    if (secret_key) payload.secret_key_encrypted = encryptSecret(String(secret_key));
-    if (client_id !== undefined) payload.client_id = client_id;
-    if (client_secret) payload.client_secret_encrypted = encryptSecret(String(client_secret));
-    if (username !== undefined) payload.username = username;
-    if (password) payload.password_encrypted = encryptSecret(String(password));
-    if (store_id !== undefined) payload.store_id = store_id;
+    if (typeof api_key === 'string' && api_key.trim()) payload.api_key_encrypted = encryptSecret(api_key.trim());
+    if (typeof secret_key === 'string' && secret_key.trim()) payload.secret_key_encrypted = encryptSecret(secret_key.trim());
+    if (client_id !== undefined) payload.client_id = String(client_id || '').trim();
+    if (typeof client_secret === 'string' && client_secret.trim()) payload.client_secret_encrypted = encryptSecret(client_secret.trim());
+    if (username !== undefined) payload.username = String(username || '').trim();
+    if (typeof password === 'string' && password.trim()) payload.password_encrypted = encryptSecret(password.trim());
+    if (store_id !== undefined) payload.store_id = String(store_id || '').trim();
 
     const { data, error } = await admin
       .from('courier_accounts')
       .upsert(payload, { onConflict: 'business_id,provider' })
-      .select('id, provider, label, client_id, username, store_id, is_sandbox, is_active')
+      .select('id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at')
       .single();
 
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ account: data });
+    return res.json({
+      account: {
+        id: data.id,
+        provider: data.provider,
+        label: data.label,
+        client_id: data.client_id,
+        username: data.username,
+        store_id: data.store_id,
+        is_sandbox: data.is_sandbox,
+        is_active: data.is_active,
+        updated_at: data.updated_at,
+        has_api_key: Boolean(data.api_key_encrypted),
+        has_secret_key: Boolean(data.secret_key_encrypted),
+        has_client_secret: Boolean(data.client_secret_encrypted),
+        has_password: Boolean(data.password_encrypted),
+      },
+    });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save courier account.' });
+  }
+});
+
+router.post('/businesses/:businessId/couriers/:provider/test', requireAuth, requireBusinessAccess('settings'), requireFeature('courier'), async (req: AuthedRequest, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== 'steadfast' && provider !== 'pathao') {
+      return res.status(400).json({ error: 'Invalid courier provider.' });
+    }
+    const result = await testCourierConnection(req.businessId!, provider);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Courier connection verification failed.' });
   }
 });
 

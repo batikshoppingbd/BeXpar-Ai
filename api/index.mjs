@@ -535,6 +535,9 @@ async function isFeatureEnabledForBusiness(businessId, featureKey) {
   if (override !== null && override !== void 0) {
     return override.is_enabled;
   }
+  if (flag?.min_plan_slug === "free") {
+    return true;
+  }
   const { data: biz } = await admin.from("businesses").select("subscription_plan_id, subscription_plans(allowed_features)").eq("id", businessId).maybeSingle();
   const plan = biz?.subscription_plans;
   if (plan?.allowed_features && Array.isArray(plan.allowed_features)) {
@@ -3190,6 +3193,67 @@ async function refreshCourierTracking(businessId, shipmentId) {
   });
   return { status: latestStatus, raw: rawPayload };
 }
+async function testCourierConnection(businessId, provider) {
+  const admin = getSupabaseAdmin();
+  const { data: account, error } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", provider).maybeSingle();
+  if (error || !account) {
+    throw new Error(`No ${provider} credentials saved yet. Please save your credentials first.`);
+  }
+  if (provider === "steadfast") {
+    const apiKey = decryptSecret(String(account.api_key_encrypted || ""));
+    const secretKey = decryptSecret(String(account.secret_key_encrypted || ""));
+    if (!apiKey || !secretKey) {
+      throw new Error("Steadfast Api-Key and Secret-Key are required.");
+    }
+    const res = await fetch("https://portal.packzy.com/api/v1/get_balance", {
+      headers: { "Api-Key": apiKey, "Secret-Key": secretKey }
+    });
+    const text = await res.text();
+    let json = {};
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`Unexpected Steadfast response (HTTP ${res.status}).`);
+    }
+    if (!res.ok || json.status !== 200) {
+      throw new Error(json.message || `Steadfast verification failed (HTTP ${res.status}).`);
+    }
+    return {
+      ok: true,
+      provider: "steadfast",
+      message: `Connected! Current balance: \u09F3${Number(json.current_balance ?? 0)}`,
+      balance: json.current_balance ?? 0
+    };
+  }
+  const clientId = String(account.client_id || "");
+  const clientSecret = decryptSecret(String(account.client_secret_encrypted || ""));
+  const username = String(account.username || "");
+  const password = decryptSecret(String(account.password_encrypted || ""));
+  if (!clientId || !clientSecret || !username || !password) {
+    throw new Error("Pathao Client ID, Client Secret, Username, and Password are required.");
+  }
+  const baseUrl = account.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
+  const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      username,
+      password,
+      grant_type: "password"
+    })
+  });
+  const tokenJson = await tokenRes.json();
+  if (!tokenRes.ok || !tokenJson.access_token) {
+    throw new Error(tokenJson.message || `Pathao authentication failed (HTTP ${tokenRes.status}).`);
+  }
+  return {
+    ok: true,
+    provider: "pathao",
+    message: `Pathao ${account.is_sandbox ? "Sandbox" : "Live"} token verified successfully!`
+  };
+}
 
 // server/routes/integrationsAndBillingRoutes.ts
 var router4 = Router4();
@@ -3499,10 +3563,23 @@ router4.get("/businesses/:businessId/capi", requireAuth, requireBusinessAccess("
   try {
     const admin = getSupabaseAdmin();
     const [{ data: config }, { data: events }] = await Promise.all([
-      admin.from("meta_capi_configs").select("id, business_id, pixel_id, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required, updated_at").eq("business_id", req.businessId).maybeSingle(),
+      admin.from("meta_capi_configs").select("id, business_id, pixel_id, access_token_encrypted, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required, updated_at").eq("business_id", req.businessId).maybeSingle(),
       admin.from("meta_capi_events").select("*").eq("business_id", req.businessId).order("created_at", { ascending: false }).limit(30)
     ]);
-    return res.json({ config, events: events || [] });
+    const safeConfig = config ? {
+      id: config.id,
+      business_id: config.business_id,
+      pixel_id: config.pixel_id,
+      test_event_code: config.test_event_code,
+      is_active: config.is_active,
+      track_purchase: config.track_purchase,
+      track_lead: config.track_lead,
+      track_initiate_checkout: config.track_initiate_checkout,
+      consent_required: config.consent_required,
+      updated_at: config.updated_at,
+      has_access_token: Boolean(config.access_token_encrypted)
+    } : null;
+    return res.json({ config: safeConfig, events: events || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to fetch CAPI config." });
   }
@@ -3513,25 +3590,39 @@ router4.put("/businesses/:businessId/capi", requireAuth, requireBusinessAccess("
     const { pixel_id, access_token, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required } = req.body;
     const payload = {
       business_id: req.businessId,
-      pixel_id: pixel_id || "",
-      test_event_code: test_event_code || "",
+      pixel_id: String(pixel_id || "").trim(),
+      test_event_code: String(test_event_code || "").trim(),
       is_active: Boolean(is_active),
       track_purchase: track_purchase !== false,
       track_lead: track_lead !== false,
       track_initiate_checkout: track_initiate_checkout !== false,
-      consent_required: consent_required !== false
+      consent_required: consent_required !== false,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
     if (access_token && String(access_token).trim()) {
       payload.access_token_encrypted = encryptSecret(String(access_token).trim());
     }
-    const { data, error } = await admin.from("meta_capi_configs").upsert(payload, { onConflict: "business_id" }).select("id, business_id, pixel_id, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required").single();
+    const { data, error } = await admin.from("meta_capi_configs").upsert(payload, { onConflict: "business_id" }).select("id, business_id, pixel_id, access_token_encrypted, test_event_code, is_active, track_purchase, track_lead, track_initiate_checkout, consent_required").single();
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ config: data });
+    return res.json({
+      config: {
+        id: data.id,
+        business_id: data.business_id,
+        pixel_id: data.pixel_id,
+        test_event_code: data.test_event_code,
+        is_active: data.is_active,
+        track_purchase: data.track_purchase,
+        track_lead: data.track_lead,
+        track_initiate_checkout: data.track_initiate_checkout,
+        consent_required: data.consent_required,
+        has_access_token: Boolean(data.access_token_encrypted)
+      }
+    });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to save CAPI settings." });
   }
 });
-router4.post("/businesses/:businessId/capi/test", requireAuth, requireBusinessAccess("settings"), async (req, res) => {
+router4.post("/businesses/:businessId/capi/test", requireAuth, requireBusinessAccess("settings"), requireFeature("meta_capi"), async (req, res) => {
   try {
     const result = await sendMetaCapiEvent({
       businessId: req.businessId,
@@ -3539,6 +3630,13 @@ router4.post("/businesses/:businessId/capi/test", requireAuth, requireBusinessAc
       eventId: `test_lead_${Date.now()}`,
       value: 100
     });
+    if ("skipped" in result && result.skipped) {
+      return res.status(400).json({ error: result.reason });
+    }
+    if ("ok" in result && !result.ok) {
+      const apiMsg = result.response?.error?.message || result.error || "Meta CAPI event dispatch failed.";
+      return res.status(400).json({ error: apiMsg, ...result });
+    }
     return res.json(result);
   } catch (err) {
     return res.status(400).json({ error: err instanceof Error ? err.message : "CAPI test failed." });
@@ -3548,10 +3646,25 @@ router4.get("/businesses/:businessId/couriers", requireAuth, requireBusinessAcce
   try {
     const admin = getSupabaseAdmin();
     const [{ data: accounts }, { data: shipments }] = await Promise.all([
-      admin.from("courier_accounts").select("id, provider, label, client_id, username, store_id, is_sandbox, is_active, updated_at").eq("business_id", req.businessId),
+      admin.from("courier_accounts").select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at").eq("business_id", req.businessId),
       admin.from("courier_shipments").select("*, events:courier_tracking_events(*)").eq("business_id", req.businessId).order("created_at", { ascending: false }).limit(50)
     ]);
-    return res.json({ accounts: accounts || [], shipments: shipments || [] });
+    const safeAccounts = (accounts || []).map((a) => ({
+      id: a.id,
+      provider: a.provider,
+      label: a.label,
+      client_id: a.client_id,
+      username: a.username,
+      store_id: a.store_id,
+      is_sandbox: a.is_sandbox,
+      is_active: a.is_active,
+      updated_at: a.updated_at,
+      has_api_key: Boolean(a.api_key_encrypted),
+      has_secret_key: Boolean(a.secret_key_encrypted),
+      has_client_secret: Boolean(a.client_secret_encrypted),
+      has_password: Boolean(a.password_encrypted)
+    }));
+    return res.json({ accounts: safeAccounts, shipments: shipments || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load couriers." });
   }
@@ -3560,28 +3673,75 @@ router4.put("/businesses/:businessId/couriers", requireAuth, requireBusinessAcce
   try {
     const admin = getSupabaseAdmin();
     const { provider, label, api_key, secret_key, client_id, client_secret, username, password, store_id, is_sandbox, is_active } = req.body;
-    if (!provider || !["steadfast", "pathao"].includes(String(provider))) {
+    const prov = String(provider || "").trim();
+    if (!["steadfast", "pathao"].includes(prov)) {
       return res.status(400).json({ error: "Valid courier provider (steadfast or pathao) is required." });
+    }
+    const { data: existing } = await admin.from("courier_accounts").select("id, api_key_encrypted, secret_key_encrypted, client_secret_encrypted, password_encrypted").eq("business_id", req.businessId).eq("provider", prov).maybeSingle();
+    if (prov === "steadfast") {
+      const hasKey = Boolean(String(api_key || "").trim() || existing?.api_key_encrypted);
+      const hasSec = Boolean(String(secret_key || "").trim() || existing?.secret_key_encrypted);
+      if (!hasKey || !hasSec) {
+        return res.status(400).json({ error: "Steadfast Api-Key and Secret-Key are required." });
+      }
+    } else {
+      const hasCid = Boolean(String(client_id || "").trim());
+      const hasCsec = Boolean(String(client_secret || "").trim() || existing?.client_secret_encrypted);
+      const hasUser = Boolean(String(username || "").trim());
+      const hasPass = Boolean(String(password || "").trim() || existing?.password_encrypted);
+      const hasStore = Boolean(String(store_id || "").trim());
+      if (!hasCid || !hasCsec || !hasUser || !hasPass || !hasStore) {
+        return res.status(400).json({ error: "Pathao Client ID, Client Secret, Username, Password, and Store ID are required." });
+      }
     }
     const payload = {
       business_id: req.businessId,
-      provider,
-      label: label || String(provider).toUpperCase(),
+      provider: prov,
+      label: label ? String(label).trim() : prov.toUpperCase(),
       is_sandbox: Boolean(is_sandbox),
-      is_active: is_active !== false
+      is_active: is_active !== false,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-    if (api_key) payload.api_key_encrypted = encryptSecret(String(api_key));
-    if (secret_key) payload.secret_key_encrypted = encryptSecret(String(secret_key));
-    if (client_id !== void 0) payload.client_id = client_id;
-    if (client_secret) payload.client_secret_encrypted = encryptSecret(String(client_secret));
-    if (username !== void 0) payload.username = username;
-    if (password) payload.password_encrypted = encryptSecret(String(password));
-    if (store_id !== void 0) payload.store_id = store_id;
-    const { data, error } = await admin.from("courier_accounts").upsert(payload, { onConflict: "business_id,provider" }).select("id, provider, label, client_id, username, store_id, is_sandbox, is_active").single();
+    if (typeof api_key === "string" && api_key.trim()) payload.api_key_encrypted = encryptSecret(api_key.trim());
+    if (typeof secret_key === "string" && secret_key.trim()) payload.secret_key_encrypted = encryptSecret(secret_key.trim());
+    if (client_id !== void 0) payload.client_id = String(client_id || "").trim();
+    if (typeof client_secret === "string" && client_secret.trim()) payload.client_secret_encrypted = encryptSecret(client_secret.trim());
+    if (username !== void 0) payload.username = String(username || "").trim();
+    if (typeof password === "string" && password.trim()) payload.password_encrypted = encryptSecret(password.trim());
+    if (store_id !== void 0) payload.store_id = String(store_id || "").trim();
+    const { data, error } = await admin.from("courier_accounts").upsert(payload, { onConflict: "business_id,provider" }).select("id, provider, label, api_key_encrypted, secret_key_encrypted, client_id, client_secret_encrypted, username, password_encrypted, store_id, is_sandbox, is_active, updated_at").single();
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ account: data });
+    return res.json({
+      account: {
+        id: data.id,
+        provider: data.provider,
+        label: data.label,
+        client_id: data.client_id,
+        username: data.username,
+        store_id: data.store_id,
+        is_sandbox: data.is_sandbox,
+        is_active: data.is_active,
+        updated_at: data.updated_at,
+        has_api_key: Boolean(data.api_key_encrypted),
+        has_secret_key: Boolean(data.secret_key_encrypted),
+        has_client_secret: Boolean(data.client_secret_encrypted),
+        has_password: Boolean(data.password_encrypted)
+      }
+    });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to save courier account." });
+  }
+});
+router4.post("/businesses/:businessId/couriers/:provider/test", requireAuth, requireBusinessAccess("settings"), requireFeature("courier"), async (req, res) => {
+  try {
+    const provider = req.params.provider;
+    if (provider !== "steadfast" && provider !== "pathao") {
+      return res.status(400).json({ error: "Invalid courier provider." });
+    }
+    const result = await testCourierConnection(req.businessId, provider);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Courier connection verification failed." });
   }
 });
 router4.post("/businesses/:businessId/orders/:orderId/book-courier", requireAuth, requireBusinessAccess("orders"), requireFeature("courier"), async (req, res) => {

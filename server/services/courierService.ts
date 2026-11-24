@@ -244,3 +244,75 @@ export async function refreshCourierTracking(businessId: string, shipmentId: str
 
   return { status: latestStatus, raw: rawPayload };
 }
+
+export async function testCourierConnection(businessId: string, provider: 'steadfast' | 'pathao') {
+  const admin = getSupabaseAdmin();
+  const { data: account, error } = await admin
+    .from('courier_accounts')
+    .select('*')
+    .eq('business_id', businessId)
+    .eq('provider', provider)
+    .maybeSingle();
+
+  if (error || !account) {
+    throw new Error(`No ${provider} credentials saved yet. Please save your credentials first.`);
+  }
+
+  if (provider === 'steadfast') {
+    const apiKey = decryptSecret(String(account.api_key_encrypted || ''));
+    const secretKey = decryptSecret(String(account.secret_key_encrypted || ''));
+    if (!apiKey || !secretKey) {
+      throw new Error('Steadfast Api-Key and Secret-Key are required.');
+    }
+
+    const res = await fetch('https://portal.packzy.com/api/v1/get_balance', {
+      headers: { 'Api-Key': apiKey, 'Secret-Key': secretKey },
+    });
+    const text = await res.text();
+    let json: { status?: number; current_balance?: number; message?: string } = {};
+    try {
+      json = JSON.parse(text) as typeof json;
+    } catch {
+      throw new Error(`Unexpected Steadfast response (HTTP ${res.status}).`);
+    }
+    if (!res.ok || json.status !== 200) {
+      throw new Error(json.message || `Steadfast verification failed (HTTP ${res.status}).`);
+    }
+    return {
+      ok: true,
+      provider: 'steadfast',
+      message: `Connected! Current balance: ৳${Number(json.current_balance ?? 0)}`,
+      balance: json.current_balance ?? 0,
+    };
+  }
+
+  const clientId = String(account.client_id || '');
+  const clientSecret = decryptSecret(String(account.client_secret_encrypted || ''));
+  const username = String(account.username || '');
+  const password = decryptSecret(String(account.password_encrypted || ''));
+  if (!clientId || !clientSecret || !username || !password) {
+    throw new Error('Pathao Client ID, Client Secret, Username, and Password are required.');
+  }
+
+  const baseUrl = account.is_sandbox ? 'https://courier-api-sandbox.pathao.com' : 'https://api-hermes.pathao.com';
+  const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      username,
+      password,
+      grant_type: 'password',
+    }),
+  });
+  const tokenJson = (await tokenRes.json()) as { access_token?: string; message?: string };
+  if (!tokenRes.ok || !tokenJson.access_token) {
+    throw new Error(tokenJson.message || `Pathao authentication failed (HTTP ${tokenRes.status}).`);
+  }
+  return {
+    ok: true,
+    provider: 'pathao',
+    message: `Pathao ${account.is_sandbox ? 'Sandbox' : 'Live'} token verified successfully!`,
+  };
+}
