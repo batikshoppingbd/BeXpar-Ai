@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4F46E5" />
+      <stop offset="100%" stop-color="#7C3AED" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bxGrad)" />
+  <path d="M156 144h118c48 0 82 28 82 68 0 26-15 47-40 57 32 10 50 34 50 66 0 46-36 77-90 77H156V144zm62 106h50c19 0 32-11 32-27s-13-27-32-27h-50v54zm0 110h56c22 0 36-12 36-30s-14-30-36-30h-56v60z" fill="#FFFFFF" />
+  <circle cx="384" cy="144" r="24" fill="#38BDF8" />
+</svg>
