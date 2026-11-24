@@ -644,7 +644,15 @@ router.get('/businesses/:businessId/orders', requireAuth, requireBusinessAccess(
       .order('created_at', { ascending: false });
 
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ orders: data || [] });
+    const orders = (data || []).map((ord) => ({
+      ...ord,
+      shipments: Array.isArray(ord.shipments)
+        ? [...ord.shipments].sort(
+            (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+          )
+        : [],
+    }));
+    return res.json({ orders });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to fetch orders.' });
   }

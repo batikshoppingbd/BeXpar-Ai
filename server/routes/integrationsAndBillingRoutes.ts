@@ -2,7 +2,14 @@ import { Router } from 'express';
 import { encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
 import { processCustomerMessageWithAi } from '../ai/customerAgent.ts';
 import { requireAuth, requireBusinessAccess, requireFeature, type AuthedRequest } from '../middleware/auth.ts';
-import { bookCourierParcel, refreshCourierTracking, testCourierConnection } from '../services/courierService.ts';
+import {
+  bookCourierParcel,
+  checkSteadfastFraudByPhone,
+  refreshCourierTracking,
+  syncActiveShipmentsForBusiness,
+  testCourierConnection,
+} from '../services/courierService.ts';
+import { evaluateOrderRisk } from '../services/orderRisk.ts';
 import {
   createMetaOAuthUrl,
   dispatchChannelReply,
@@ -722,6 +729,7 @@ router.post('/businesses/:businessId/orders/:orderId/book-courier', requireAuth,
     const booking = await bookCourierParcel({
       businessId: req.businessId!,
       orderId: order.id,
+      orderNumber: order.order_number,
       provider,
       recipientName: order.customer_name,
       recipientPhone: order.customer_phone,
@@ -745,6 +753,65 @@ router.post('/businesses/:businessId/shipments/:shipmentId/sync', requireAuth, r
     return res.json(result);
   } catch (err) {
     return res.status(400).json({ error: err instanceof Error ? err.message : 'Tracking sync failed.' });
+  }
+});
+
+router.post('/businesses/:businessId/orders/sync-couriers', requireAuth, requireBusinessAccess('orders'), async (req: AuthedRequest, res) => {
+  try {
+    const result = await syncActiveShipmentsForBusiness(req.businessId!);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Courier status sync failed.' });
+  }
+});
+
+router.post('/businesses/:businessId/orders/:orderId/detect-risk', requireAuth, requireBusinessAccess('orders'), async (req: AuthedRequest, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    const { data: order } = await admin
+      .from('orders')
+      .select('id, customer_phone, total_amount')
+      .eq('id', req.params.orderId)
+      .eq('business_id', req.businessId!)
+      .maybeSingle();
+
+    if (!order) return res.status(404).json({ error: 'Order not found.' });
+
+    const risk = await evaluateOrderRisk({
+      businessId: req.businessId!,
+      customerPhone: order.customer_phone,
+      totalAmount: Number(order.total_amount || 0),
+      excludeOrderId: order.id,
+    });
+
+    await admin
+      .from('orders')
+      .update({
+        risk_level: risk.riskLevel,
+        risk_reasons: risk.reasons,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', order.id)
+      .eq('business_id', req.businessId!);
+
+    return res.json({
+      risk_level: risk.riskLevel,
+      risk_reasons: risk.reasons,
+      courierStats: risk.courierStats || null,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Risk auto-detection failed.' });
+  }
+});
+
+router.get('/businesses/:businessId/couriers/fraud-check', requireAuth, requireBusinessAccess('orders'), async (req: AuthedRequest, res) => {
+  try {
+    const phone = String(req.query.phone || '').trim();
+    if (!phone) return res.status(400).json({ error: 'Phone number is required.' });
+    const stats = await checkSteadfastFraudByPhone(req.businessId!, phone);
+    return res.json(stats);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Fraud check failed.' });
   }
 });
 

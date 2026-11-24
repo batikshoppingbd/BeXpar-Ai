@@ -694,50 +694,463 @@ function rateLimit(maxRequests, windowMs) {
   };
 }
 
+// server/services/courierService.ts
+function normalizeBdPhone(phone) {
+  const digits = String(phone || "").replace(/[^\d]/g, "");
+  if (digits.startsWith("8801") && digits.length === 13) {
+    return digits.slice(2);
+  }
+  if (digits.startsWith("01") && digits.length === 11) {
+    return digits;
+  }
+  return digits;
+}
+function mapCourierStatusToOrderStatus(parcelStatus) {
+  const s = String(parcelStatus || "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "delivered" || s === "partial_delivered" || s === "delivered_approval_pending") {
+    return "delivered";
+  }
+  if (s === "cancelled" || s === "cancelled_approval_pending") {
+    return "cancelled";
+  }
+  if (s === "returned" || s === "return" || s === "pickup_cancelled") {
+    return "returned";
+  }
+  if (["in_review", "pending", "hold", "in_transit", "picked_up", "assigned_for_delivery", "unknown"].includes(s)) {
+    return "shipped";
+  }
+  return null;
+}
+async function checkSteadfastFraudByPhone(businessId, phone) {
+  const normalized = normalizeBdPhone(phone);
+  if (!normalized || normalized.length < 10) {
+    return { checked: false, totalParcels: 0, totalDelivered: 0, totalCancelled: 0, successRate: null };
+  }
+  try {
+    const admin = getSupabaseAdmin();
+    const { data: account } = await admin.from("courier_accounts").select("api_key_encrypted, secret_key_encrypted, is_active").eq("business_id", businessId).eq("provider", "steadfast").eq("is_active", true).maybeSingle();
+    if (!account) {
+      return { checked: false, totalParcels: 0, totalDelivered: 0, totalCancelled: 0, successRate: null };
+    }
+    const apiKey = decryptSecret(String(account.api_key_encrypted || ""));
+    const secretKey = decryptSecret(String(account.secret_key_encrypted || ""));
+    if (!apiKey || !secretKey) {
+      return { checked: false, totalParcels: 0, totalDelivered: 0, totalCancelled: 0, successRate: null };
+    }
+    const res = await fetch(`https://portal.packzy.com/api/v1/fraud_check/${encodeURIComponent(normalized)}`, {
+      method: "GET",
+      headers: {
+        "Api-Key": apiKey,
+        "Secret-Key": secretKey,
+        Accept: "application/json"
+      },
+      signal: AbortSignal.timeout(4500)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && data.total_parcels === void 0) {
+      return {
+        checked: false,
+        provider: "steadfast",
+        phone: normalized,
+        totalParcels: 0,
+        totalDelivered: 0,
+        totalCancelled: 0,
+        successRate: null,
+        error: data.message || `HTTP ${res.status}`
+      };
+    }
+    const totalParcels = Math.max(0, Number(data.total_parcels ?? 0));
+    const totalDelivered = Math.max(0, Number(data.total_delivered ?? 0));
+    const totalCancelled = Math.max(0, Number(data.total_cancelled ?? 0));
+    const completed = totalDelivered + totalCancelled;
+    const denom = completed > 0 ? completed : totalParcels;
+    const successRate = denom > 0 ? Math.round(totalDelivered / denom * 100) : null;
+    return {
+      checked: true,
+      provider: "steadfast",
+      phone: normalized,
+      totalParcels,
+      totalDelivered,
+      totalCancelled,
+      successRate
+    };
+  } catch (err) {
+    return {
+      checked: false,
+      provider: "steadfast",
+      phone: normalized,
+      totalParcels: 0,
+      totalDelivered: 0,
+      totalCancelled: 0,
+      successRate: null,
+      error: err instanceof Error ? err.message : "Fraud check unavailable"
+    };
+  }
+}
+async function bookCourierParcel(params) {
+  const admin = getSupabaseAdmin();
+  const { data: account, error: accErr } = await admin.from("courier_accounts").select("*").eq("business_id", params.businessId).eq("provider", params.provider).eq("is_active", true).maybeSingle();
+  if (accErr || !account) {
+    throw new Error(`No active ${params.provider} courier account configured. Please configure credentials in Courier Settings.`);
+  }
+  let trackingId = "";
+  let consignmentId = "";
+  let parcelStatus = "created";
+  let rawResponse = {};
+  if (params.provider === "steadfast") {
+    const apiKey = decryptSecret(account.api_key_encrypted || "");
+    const secretKey = decryptSecret(account.secret_key_encrypted || "");
+    if (!apiKey || !secretKey) {
+      throw new Error("Steadfast API Key and Secret Key are required.");
+    }
+    const invoiceRef = (params.orderNumber || params.orderId).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20);
+    const res = await fetch("https://portal.packzy.com/api/v1/create_order", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "Api-Key": apiKey,
+        "Secret-Key": secretKey
+      },
+      body: JSON.stringify({
+        invoice: invoiceRef,
+        recipient_name: params.recipientName,
+        recipient_phone: normalizeBdPhone(params.recipientPhone) || params.recipientPhone,
+        recipient_address: params.recipientAddress,
+        cod_amount: Math.round(params.codAmount),
+        note: params.note || ""
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.status !== 200 || !data.consignment?.tracking_code && !data.consignment?.consignment_id) {
+      const firstFieldErr = data.errors ? Object.values(data.errors).flat()[0] : void 0;
+      throw new Error(firstFieldErr || data.message || `Steadfast booking failed (HTTP ${res.status}).`);
+    }
+    consignmentId = data.consignment.consignment_id !== void 0 && data.consignment.consignment_id !== null ? String(data.consignment.consignment_id) : "";
+    trackingId = String(data.consignment.tracking_code || consignmentId);
+    parcelStatus = data.consignment.status || "in_review";
+    rawResponse = data;
+  } else if (params.provider === "pathao") {
+    const clientId = account.client_id || "";
+    const clientSecret = decryptSecret(account.client_secret_encrypted || "");
+    const username = account.username || "";
+    const password = decryptSecret(account.password_encrypted || "");
+    const storeId = Number(account.store_id || 0);
+    if (!clientId || !clientSecret || !username || !password || !storeId) {
+      throw new Error("Pathao Client ID, Client Secret, Username, Password, and Store ID are required.");
+    }
+    const baseUrl = account.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
+    const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        client_secret: clientSecret,
+        username,
+        password,
+        grant_type: "password"
+      })
+    });
+    const tokenJson = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      throw new Error(tokenJson.message || "Pathao authentication failed.");
+    }
+    const orderRes = await fetch(`${baseUrl}/aladdin/api/v1/orders`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${tokenJson.access_token}`
+      },
+      body: JSON.stringify({
+        store_id: storeId,
+        merchant_order_id: (params.orderNumber || params.orderId).slice(0, 30),
+        recipient_name: params.recipientName,
+        recipient_phone: normalizeBdPhone(params.recipientPhone) || params.recipientPhone,
+        recipient_address: params.recipientAddress,
+        recipient_city: params.cityId || 1,
+        recipient_zone: params.zoneId || 1,
+        delivery_type: 48,
+        item_type: 2,
+        item_quantity: 1,
+        item_weight: params.itemWeight || 0.5,
+        amount_to_collect: Math.round(params.codAmount),
+        special_instruction: params.note || ""
+      })
+    });
+    const orderJson = await orderRes.json().catch(() => ({}));
+    if (!orderRes.ok || !orderJson.data?.consignment_id) {
+      throw new Error(orderJson.message || `Pathao booking failed (HTTP ${orderRes.status}).`);
+    }
+    trackingId = String(orderJson.data.consignment_id);
+    consignmentId = String(orderJson.data.consignment_id);
+    parcelStatus = orderJson.data.order_status || "Pending";
+    rawResponse = orderJson;
+  }
+  const { data: shipment, error: shipErr } = await admin.from("courier_shipments").insert({
+    business_id: params.businessId,
+    order_id: params.orderId,
+    courier_account_id: account.id,
+    provider: params.provider,
+    tracking_id: trackingId,
+    consignment_id: consignmentId,
+    parcel_status: parcelStatus,
+    cod_amount: params.codAmount,
+    raw_response: rawResponse
+  }).select("*").single();
+  if (shipErr) {
+    throw new Error(`Booked on ${params.provider} (Parcel ID: ${consignmentId || trackingId}) but failed to save shipment: ${shipErr.message}`);
+  }
+  if (shipment) {
+    await admin.from("courier_tracking_events").insert({
+      business_id: params.businessId,
+      shipment_id: shipment.id,
+      status: parcelStatus,
+      description: `Booked parcel via ${params.provider.toUpperCase()} (Parcel ID: ${consignmentId || trackingId})`,
+      raw_payload: rawResponse
+    });
+  }
+  await admin.from("orders").update({
+    courier_name: params.provider,
+    tracking_id: trackingId,
+    order_status: "shipped",
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  }).eq("id", params.orderId).eq("business_id", params.businessId);
+  return { trackingId, consignmentId, status: parcelStatus, shipment, raw: rawResponse };
+}
+async function refreshCourierTracking(businessId, shipmentId) {
+  const admin = getSupabaseAdmin();
+  const { data: shipment } = await admin.from("courier_shipments").select("*, account:courier_accounts(*)").eq("id", shipmentId).eq("business_id", businessId).maybeSingle();
+  if (!shipment || !shipment.account) {
+    throw new Error("Shipment or courier account not found.");
+  }
+  const acc = shipment.account;
+  let latestStatus = String(shipment.parcel_status || "in_review");
+  let rawPayload = {};
+  let resolvedConsignmentId = String(shipment.consignment_id || "");
+  if (shipment.provider === "steadfast") {
+    const apiKey = decryptSecret(String(acc.api_key_encrypted || ""));
+    const secretKey = decryptSecret(String(acc.secret_key_encrypted || ""));
+    const endpoint = resolvedConsignmentId ? `https://portal.packzy.com/api/v1/status_by_cid/${encodeURIComponent(resolvedConsignmentId)}` : `https://portal.packzy.com/api/v1/status_by_trackingcode/${encodeURIComponent(String(shipment.tracking_id))}`;
+    const res = await fetch(endpoint, {
+      headers: { "Api-Key": apiKey, "Secret-Key": secretKey, Accept: "application/json" },
+      signal: AbortSignal.timeout(5e3)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.delivery_status) {
+      latestStatus = data.delivery_status;
+      if (!resolvedConsignmentId && data.consignment_id) {
+        resolvedConsignmentId = String(data.consignment_id);
+      }
+      rawPayload = data;
+    }
+  } else if (shipment.provider === "pathao") {
+    const baseUrl = acc.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
+    const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        client_id: acc.client_id,
+        client_secret: decryptSecret(String(acc.client_secret_encrypted || "")),
+        username: acc.username,
+        password: decryptSecret(String(acc.password_encrypted || "")),
+        grant_type: "password"
+      }),
+      signal: AbortSignal.timeout(5e3)
+    });
+    const tokenJson = await tokenRes.json().catch(() => ({}));
+    if (tokenJson.access_token) {
+      const infoRes = await fetch(`${baseUrl}/aladdin/api/v1/orders/${shipment.consignment_id}/info`, {
+        headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+        signal: AbortSignal.timeout(5e3)
+      });
+      const infoJson = await infoRes.json().catch(() => ({}));
+      if (infoRes.ok && infoJson.data?.order_status) {
+        latestStatus = infoJson.data.order_status;
+        rawPayload = infoJson;
+      }
+    }
+  }
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  await admin.from("courier_shipments").update({
+    parcel_status: latestStatus,
+    ...resolvedConsignmentId ? { consignment_id: resolvedConsignmentId } : {},
+    updated_at: nowIso
+  }).eq("id", shipmentId);
+  if (latestStatus !== shipment.parcel_status) {
+    await admin.from("courier_tracking_events").insert({
+      business_id: businessId,
+      shipment_id: shipmentId,
+      status: latestStatus,
+      description: `Synced status from ${shipment.provider}: ${latestStatus}`,
+      raw_payload: rawPayload
+    });
+  }
+  const mappedOrderStatus = mapCourierStatusToOrderStatus(latestStatus);
+  if (mappedOrderStatus && shipment.order_id) {
+    const { data: ord } = await admin.from("orders").select("id, order_status").eq("id", shipment.order_id).eq("business_id", businessId).maybeSingle();
+    if (ord && ord.order_status !== mappedOrderStatus) {
+      await admin.from("orders").update({ order_status: mappedOrderStatus, updated_at: nowIso }).eq("id", ord.id).eq("business_id", businessId);
+      await admin.from("order_status_history").insert({
+        business_id: businessId,
+        order_id: ord.id,
+        old_status: ord.order_status,
+        new_status: mappedOrderStatus,
+        note: `Auto-detected from ${String(shipment.provider).toUpperCase()} (${latestStatus})`
+      });
+    }
+  }
+  return {
+    status: latestStatus,
+    consignmentId: resolvedConsignmentId,
+    mappedOrderStatus,
+    raw: rawPayload
+  };
+}
+async function syncActiveShipmentsForBusiness(businessId) {
+  const admin = getSupabaseAdmin();
+  const { data: shipments } = await admin.from("courier_shipments").select("id, parcel_status").eq("business_id", businessId).not("parcel_status", "in", '("delivered","cancelled","returned","partial_delivered")').order("created_at", { ascending: false }).limit(10);
+  if (!shipments || shipments.length === 0) {
+    return { synced: 0, results: [] };
+  }
+  const settled = await Promise.allSettled(
+    shipments.map(async (s) => {
+      const r = await refreshCourierTracking(businessId, s.id);
+      return { shipmentId: s.id, status: r.status };
+    })
+  );
+  const results = settled.filter((r) => r.status === "fulfilled").map((r) => r.value);
+  return { synced: results.length, results };
+}
+async function testCourierConnection(businessId, provider) {
+  const admin = getSupabaseAdmin();
+  const { data: account, error } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", provider).maybeSingle();
+  if (error || !account) {
+    throw new Error(`No ${provider} credentials saved yet. Please save your credentials first.`);
+  }
+  if (provider === "steadfast") {
+    const apiKey = decryptSecret(String(account.api_key_encrypted || ""));
+    const secretKey = decryptSecret(String(account.secret_key_encrypted || ""));
+    if (!apiKey || !secretKey) {
+      throw new Error("Steadfast Api-Key and Secret-Key are required.");
+    }
+    const res = await fetch("https://portal.packzy.com/api/v1/get_balance", {
+      headers: { "Api-Key": apiKey, "Secret-Key": secretKey }
+    });
+    const text = await res.text();
+    let json = {};
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`Unexpected Steadfast response (HTTP ${res.status}).`);
+    }
+    if (!res.ok || json.status !== 200) {
+      throw new Error(json.message || `Steadfast verification failed (HTTP ${res.status}).`);
+    }
+    return {
+      ok: true,
+      provider: "steadfast",
+      message: `Connected! Current balance: \u09F3${Number(json.current_balance ?? 0)}`,
+      balance: json.current_balance ?? 0
+    };
+  }
+  const clientId = String(account.client_id || "");
+  const clientSecret = decryptSecret(String(account.client_secret_encrypted || ""));
+  const username = String(account.username || "");
+  const password = decryptSecret(String(account.password_encrypted || ""));
+  if (!clientId || !clientSecret || !username || !password) {
+    throw new Error("Pathao Client ID, Client Secret, Username, and Password are required.");
+  }
+  const baseUrl = account.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
+  const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      username,
+      password,
+      grant_type: "password"
+    })
+  });
+  const tokenJson = await tokenRes.json();
+  if (!tokenRes.ok || !tokenJson.access_token) {
+    throw new Error(tokenJson.message || `Pathao authentication failed (HTTP ${tokenRes.status}).`);
+  }
+  return {
+    ok: true,
+    provider: "pathao",
+    message: `Pathao ${account.is_sandbox ? "Sandbox" : "Live"} token verified successfully!`
+  };
+}
+
 // server/services/orderRisk.ts
 async function evaluateOrderRisk(params) {
   const admin = getSupabaseAdmin();
   const reasons = [];
   let score = 0;
   const cleanPhone = (params.customerPhone || "").replace(/\s+/g, "");
-  if (!cleanPhone || cleanPhone.length < 8) {
+  const normalizedPhone = normalizeBdPhone(cleanPhone);
+  if (!cleanPhone || normalizedPhone.length < 10) {
     score += 3;
     reasons.push("Invalid or incomplete phone number format");
   }
-  if (cleanPhone) {
-    const { data: priorOrders } = await admin.from("orders").select("id, order_status, created_at, total_amount").eq("business_id", params.businessId).eq("customer_phone", cleanPhone).order("created_at", { ascending: false }).limit(20);
-    if (priorOrders && priorOrders.length > 0) {
-      const recent15Min = priorOrders.filter(
-        (o) => Date.now() - new Date(o.created_at).getTime() < 15 * 60 * 1e3
+  const [priorRes, courierStats] = await Promise.all([
+    cleanPhone ? admin.from("orders").select("id, order_status, created_at, total_amount").eq("business_id", params.businessId).or(`customer_phone.eq.${cleanPhone},customer_phone.eq.${normalizedPhone}`).order("created_at", { ascending: false }).limit(20) : Promise.resolve({ data: [] }),
+    checkSteadfastFraudByPhone(params.businessId, cleanPhone)
+  ]);
+  const priorOrders = (priorRes.data || []).filter((o) => !params.excludeOrderId || o.id !== params.excludeOrderId);
+  if (priorOrders.length > 0) {
+    const recent15Min = priorOrders.filter(
+      (o) => Date.now() - new Date(o.created_at).getTime() < 15 * 60 * 1e3
+    );
+    if (recent15Min.length >= 1) {
+      score += 2;
+      reasons.push(`Repeated order attempt within 15 minutes (${recent15Min.length} prior)`);
+    }
+    const cancelledCount = priorOrders.filter((o) => o.order_status === "cancelled").length;
+    const returnedCount = priorOrders.filter((o) => o.order_status === "returned").length;
+    const deliveredCount = priorOrders.filter((o) => o.order_status === "delivered").length;
+    if (cancelledCount >= 2) {
+      score += 3;
+      reasons.push(`Store history: ${cancelledCount} cancelled orders on this number`);
+    } else if (cancelledCount === 1) {
+      score += 1;
+      reasons.push("Store history: 1 previously cancelled order");
+    }
+    if (returnedCount >= 1) {
+      score += 3;
+      reasons.push(`Store history: ${returnedCount} returned order(s)`);
+    }
+    if (deliveredCount >= 2 && cancelledCount === 0 && returnedCount === 0) {
+      score = Math.max(0, score - 2);
+      reasons.push(`Verified repeat store customer (${deliveredCount} delivered)`);
+    }
+  }
+  if (courierStats.checked) {
+    if (courierStats.totalParcels === 0) {
+      reasons.push("Steadfast Auto-Detection: 0 prior parcels (New courier recipient)");
+    } else {
+      const rateLabel = courierStats.successRate !== null ? ` (${courierStats.successRate}% delivery success)` : "";
+      reasons.push(
+        `Steadfast Auto-Detection: ${courierStats.totalParcels} parcels \xB7 ${courierStats.totalDelivered} delivered \xB7 ${courierStats.totalCancelled} cancelled${rateLabel}`
       );
-      if (recent15Min.length >= 1) {
+      if (courierStats.totalCancelled >= 3 && (courierStats.successRate ?? 100) < 60) {
+        score += 4;
+      } else if (courierStats.totalCancelled >= 2 && (courierStats.successRate ?? 100) < 75) {
         score += 2;
-        reasons.push(`Repeated order attempt within 15 minutes (${recent15Min.length} prior)`);
-      }
-      const cancelledCount = priorOrders.filter((o) => o.order_status === "cancelled").length;
-      const returnedCount = priorOrders.filter((o) => o.order_status === "returned").length;
-      const deliveredCount = priorOrders.filter((o) => o.order_status === "delivered").length;
-      if (cancelledCount >= 2) {
-        score += 3;
-        reasons.push(`High cancellation history (${cancelledCount} cancelled orders)`);
-      } else if (cancelledCount === 1) {
-        score += 1;
-        reasons.push("1 previously cancelled order on this number");
-      }
-      if (returnedCount >= 1) {
-        score += 3;
-        reasons.push(`Previous return history (${returnedCount} returned orders)`);
-      }
-      if (deliveredCount >= 2 && cancelledCount === 0 && returnedCount === 0) {
-        score = Math.max(0, score - 2);
-        reasons.push(`Verified repeat customer (${deliveredCount} delivered orders)`);
+      } else if (courierStats.totalDelivered >= 3 && (courierStats.successRate ?? 0) >= 85) {
+        score = Math.max(0, score - 1);
       }
     }
+  } else if (reasons.length === 0) {
+    reasons.push("Local Auto-Detection: Phone format valid \xB7 No prior duplicate or return flags");
   }
   let riskLevel = "low";
   if (score >= 4) riskLevel = "high";
   else if (score >= 2) riskLevel = "medium";
-  return { riskLevel, reasons };
+  return { riskLevel, reasons, courierStats };
 }
 
 // server/services/realtimeBus.ts
@@ -1991,7 +2404,13 @@ router2.get("/businesses/:businessId/orders", requireAuth, requireBusinessAccess
     const admin = getSupabaseAdmin();
     const { data, error } = await admin.from("orders").select("*, items:order_items(*), history:order_status_history(*), shipments:courier_shipments(*)").eq("business_id", req.businessId).order("created_at", { ascending: false });
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ orders: data || [] });
+    const orders = (data || []).map((ord) => ({
+      ...ord,
+      shipments: Array.isArray(ord.shipments) ? [...ord.shipments].sort(
+        (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+      ) : []
+    }));
+    return res.json({ orders });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to fetch orders." });
   }
@@ -3012,250 +3431,6 @@ var inboxAndAiRoutes_default = router3;
 
 // server/routes/integrationsAndBillingRoutes.ts
 import { Router as Router4 } from "express";
-
-// server/services/courierService.ts
-async function bookCourierParcel(params) {
-  const admin = getSupabaseAdmin();
-  const { data: account, error: accErr } = await admin.from("courier_accounts").select("*").eq("business_id", params.businessId).eq("provider", params.provider).eq("is_active", true).maybeSingle();
-  if (accErr || !account) {
-    throw new Error(`No active ${params.provider} courier account configured. Please configure credentials in Courier Settings.`);
-  }
-  let trackingId = "";
-  let consignmentId = "";
-  let parcelStatus = "created";
-  let rawResponse = {};
-  if (params.provider === "steadfast") {
-    const apiKey = decryptSecret(account.api_key_encrypted || "");
-    const secretKey = decryptSecret(account.secret_key_encrypted || "");
-    if (!apiKey || !secretKey) {
-      throw new Error("Steadfast API Key and Secret Key are required.");
-    }
-    const res = await fetch("https://portal.packzy.com/api/v1/create_order", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Api-Key": apiKey,
-        "Secret-Key": secretKey
-      },
-      body: JSON.stringify({
-        invoice: params.orderId.slice(0, 20),
-        recipient_name: params.recipientName,
-        recipient_phone: params.recipientPhone,
-        recipient_address: params.recipientAddress,
-        cod_amount: Math.round(params.codAmount),
-        note: params.note || ""
-      })
-    });
-    const data = await res.json();
-    if (!res.ok || data.status !== 200 || !data.consignment?.tracking_code) {
-      throw new Error(data.message || `Steadfast booking failed (HTTP ${res.status}).`);
-    }
-    trackingId = String(data.consignment.tracking_code);
-    consignmentId = String(data.consignment.consignment_id || "");
-    parcelStatus = data.consignment.status || "in_review";
-    rawResponse = data;
-  } else if (params.provider === "pathao") {
-    const clientId = account.client_id || "";
-    const clientSecret = decryptSecret(account.client_secret_encrypted || "");
-    const username = account.username || "";
-    const password = decryptSecret(account.password_encrypted || "");
-    const storeId = Number(account.store_id || 0);
-    if (!clientId || !clientSecret || !username || !password || !storeId) {
-      throw new Error("Pathao Client ID, Client Secret, Username, Password, and Store ID are required.");
-    }
-    const baseUrl = account.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
-    const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({
-        client_id: clientId,
-        client_secret: clientSecret,
-        username,
-        password,
-        grant_type: "password"
-      })
-    });
-    const tokenJson = await tokenRes.json();
-    if (!tokenRes.ok || !tokenJson.access_token) {
-      throw new Error(tokenJson.message || "Pathao authentication failed.");
-    }
-    const orderRes = await fetch(`${baseUrl}/aladdin/api/v1/orders`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: `Bearer ${tokenJson.access_token}`
-      },
-      body: JSON.stringify({
-        store_id: storeId,
-        merchant_order_id: params.orderId.slice(0, 30),
-        recipient_name: params.recipientName,
-        recipient_phone: params.recipientPhone,
-        recipient_address: params.recipientAddress,
-        recipient_city: params.cityId || 1,
-        recipient_zone: params.zoneId || 1,
-        delivery_type: 48,
-        item_type: 2,
-        item_quantity: 1,
-        item_weight: params.itemWeight || 0.5,
-        amount_to_collect: Math.round(params.codAmount),
-        special_instruction: params.note || ""
-      })
-    });
-    const orderJson = await orderRes.json();
-    if (!orderRes.ok || !orderJson.data?.consignment_id) {
-      throw new Error(orderJson.message || `Pathao booking failed (HTTP ${orderRes.status}).`);
-    }
-    trackingId = orderJson.data.consignment_id;
-    consignmentId = orderJson.data.consignment_id;
-    parcelStatus = orderJson.data.order_status || "Pending";
-    rawResponse = orderJson;
-  }
-  const { data: shipment } = await admin.from("courier_shipments").insert({
-    business_id: params.businessId,
-    order_id: params.orderId,
-    courier_account_id: account.id,
-    provider: params.provider,
-    tracking_id: trackingId,
-    consignment_id: consignmentId,
-    parcel_status: parcelStatus,
-    cod_amount: params.codAmount,
-    raw_response: rawResponse
-  }).select("*").single();
-  if (shipment) {
-    await admin.from("courier_tracking_events").insert({
-      business_id: params.businessId,
-      shipment_id: shipment.id,
-      status: parcelStatus,
-      description: `Booked parcel via ${params.provider.toUpperCase()}`,
-      raw_payload: rawResponse
-    });
-  }
-  await admin.from("orders").update({
-    courier_name: params.provider,
-    tracking_id: trackingId,
-    order_status: "shipped"
-  }).eq("id", params.orderId).eq("business_id", params.businessId);
-  return { trackingId, consignmentId, status: parcelStatus, raw: rawResponse };
-}
-async function refreshCourierTracking(businessId, shipmentId) {
-  const admin = getSupabaseAdmin();
-  const { data: shipment } = await admin.from("courier_shipments").select("*, account:courier_accounts(*)").eq("id", shipmentId).eq("business_id", businessId).maybeSingle();
-  if (!shipment || !shipment.account) {
-    throw new Error("Shipment or courier account not found.");
-  }
-  const acc = shipment.account;
-  let latestStatus = shipment.parcel_status;
-  let rawPayload = {};
-  if (shipment.provider === "steadfast") {
-    const apiKey = decryptSecret(String(acc.api_key_encrypted || ""));
-    const secretKey = decryptSecret(String(acc.secret_key_encrypted || ""));
-    const res = await fetch(`https://portal.packzy.com/api/v1/status_by_trackingcode/${shipment.tracking_id}`, {
-      headers: { "Api-Key": apiKey, "Secret-Key": secretKey }
-    });
-    const data = await res.json();
-    if (res.ok && data.delivery_status) {
-      latestStatus = data.delivery_status;
-      rawPayload = data;
-    }
-  } else if (shipment.provider === "pathao") {
-    const baseUrl = acc.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
-    const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: acc.client_id,
-        client_secret: decryptSecret(String(acc.client_secret_encrypted || "")),
-        username: acc.username,
-        password: decryptSecret(String(acc.password_encrypted || "")),
-        grant_type: "password"
-      })
-    });
-    const tokenJson = await tokenRes.json();
-    if (tokenJson.access_token) {
-      const infoRes = await fetch(`${baseUrl}/aladdin/api/v1/orders/${shipment.consignment_id}/info`, {
-        headers: { Authorization: `Bearer ${tokenJson.access_token}` }
-      });
-      const infoJson = await infoRes.json();
-      if (infoRes.ok && infoJson.data?.order_status) {
-        latestStatus = infoJson.data.order_status;
-        rawPayload = infoJson;
-      }
-    }
-  }
-  await admin.from("courier_shipments").update({ parcel_status: latestStatus }).eq("id", shipmentId);
-  await admin.from("courier_tracking_events").insert({
-    business_id: businessId,
-    shipment_id: shipmentId,
-    status: latestStatus,
-    description: `Synced status from ${shipment.provider}: ${latestStatus}`,
-    raw_payload: rawPayload
-  });
-  return { status: latestStatus, raw: rawPayload };
-}
-async function testCourierConnection(businessId, provider) {
-  const admin = getSupabaseAdmin();
-  const { data: account, error } = await admin.from("courier_accounts").select("*").eq("business_id", businessId).eq("provider", provider).maybeSingle();
-  if (error || !account) {
-    throw new Error(`No ${provider} credentials saved yet. Please save your credentials first.`);
-  }
-  if (provider === "steadfast") {
-    const apiKey = decryptSecret(String(account.api_key_encrypted || ""));
-    const secretKey = decryptSecret(String(account.secret_key_encrypted || ""));
-    if (!apiKey || !secretKey) {
-      throw new Error("Steadfast Api-Key and Secret-Key are required.");
-    }
-    const res = await fetch("https://portal.packzy.com/api/v1/get_balance", {
-      headers: { "Api-Key": apiKey, "Secret-Key": secretKey }
-    });
-    const text = await res.text();
-    let json = {};
-    try {
-      json = JSON.parse(text);
-    } catch {
-      throw new Error(`Unexpected Steadfast response (HTTP ${res.status}).`);
-    }
-    if (!res.ok || json.status !== 200) {
-      throw new Error(json.message || `Steadfast verification failed (HTTP ${res.status}).`);
-    }
-    return {
-      ok: true,
-      provider: "steadfast",
-      message: `Connected! Current balance: \u09F3${Number(json.current_balance ?? 0)}`,
-      balance: json.current_balance ?? 0
-    };
-  }
-  const clientId = String(account.client_id || "");
-  const clientSecret = decryptSecret(String(account.client_secret_encrypted || ""));
-  const username = String(account.username || "");
-  const password = decryptSecret(String(account.password_encrypted || ""));
-  if (!clientId || !clientSecret || !username || !password) {
-    throw new Error("Pathao Client ID, Client Secret, Username, and Password are required.");
-  }
-  const baseUrl = account.is_sandbox ? "https://courier-api-sandbox.pathao.com" : "https://api-hermes.pathao.com";
-  const tokenRes = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
-      client_id: clientId,
-      client_secret: clientSecret,
-      username,
-      password,
-      grant_type: "password"
-    })
-  });
-  const tokenJson = await tokenRes.json();
-  if (!tokenRes.ok || !tokenJson.access_token) {
-    throw new Error(tokenJson.message || `Pathao authentication failed (HTTP ${tokenRes.status}).`);
-  }
-  return {
-    ok: true,
-    provider: "pathao",
-    message: `Pathao ${account.is_sandbox ? "Sandbox" : "Live"} token verified successfully!`
-  };
-}
-
-// server/routes/integrationsAndBillingRoutes.ts
 var router4 = Router4();
 router4.get("/catalog/plans", requireAuth, async (_req, res) => {
   try {
@@ -3754,6 +3929,7 @@ router4.post("/businesses/:businessId/orders/:orderId/book-courier", requireAuth
     const booking = await bookCourierParcel({
       businessId: req.businessId,
       orderId: order.id,
+      orderNumber: order.order_number,
       provider,
       recipientName: order.customer_name,
       recipientPhone: order.customer_phone,
@@ -3775,6 +3951,49 @@ router4.post("/businesses/:businessId/shipments/:shipmentId/sync", requireAuth, 
     return res.json(result);
   } catch (err) {
     return res.status(400).json({ error: err instanceof Error ? err.message : "Tracking sync failed." });
+  }
+});
+router4.post("/businesses/:businessId/orders/sync-couriers", requireAuth, requireBusinessAccess("orders"), async (req, res) => {
+  try {
+    const result = await syncActiveShipmentsForBusiness(req.businessId);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Courier status sync failed." });
+  }
+});
+router4.post("/businesses/:businessId/orders/:orderId/detect-risk", requireAuth, requireBusinessAccess("orders"), async (req, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    const { data: order } = await admin.from("orders").select("id, customer_phone, total_amount").eq("id", req.params.orderId).eq("business_id", req.businessId).maybeSingle();
+    if (!order) return res.status(404).json({ error: "Order not found." });
+    const risk = await evaluateOrderRisk({
+      businessId: req.businessId,
+      customerPhone: order.customer_phone,
+      totalAmount: Number(order.total_amount || 0),
+      excludeOrderId: order.id
+    });
+    await admin.from("orders").update({
+      risk_level: risk.riskLevel,
+      risk_reasons: risk.reasons,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", order.id).eq("business_id", req.businessId);
+    return res.json({
+      risk_level: risk.riskLevel,
+      risk_reasons: risk.reasons,
+      courierStats: risk.courierStats || null
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Risk auto-detection failed." });
+  }
+});
+router4.get("/businesses/:businessId/couriers/fraud-check", requireAuth, requireBusinessAccess("orders"), async (req, res) => {
+  try {
+    const phone = String(req.query.phone || "").trim();
+    if (!phone) return res.status(400).json({ error: "Phone number is required." });
+    const stats = await checkSteadfastFraudByPhone(req.businessId, phone);
+    return res.json(stats);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Fraud check failed." });
   }
 });
 router4.get("/businesses/:businessId/wallet", requireAuth, requireBusinessAccess(), async (req, res) => {

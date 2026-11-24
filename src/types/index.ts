@@ -173,7 +173,16 @@ export interface Order {
   notes?: string;
   items?: OrderItem[];
   history?: Array<{ id: string; old_status: string; new_status: string; note: string; created_at: string }>;
-  shipments?: Array<{ id: string; provider: string; tracking_id: string; parcel_status: string; created_at: string }>;
+  shipments?: Array<{
+    id: string;
+    provider: string;
+    tracking_id: string;
+    consignment_id?: string;
+    parcel_status: string;
+    cod_amount?: number;
+    created_at: string;
+    updated_at?: string;
+  }>;
   created_at: string;
 }
 

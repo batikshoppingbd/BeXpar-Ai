@@ -32,7 +32,7 @@ export const PWAInstallButton: React.FC<{ label?: string; compact?: boolean }> =
         <button
           type="button"
           onClick={() => setShowIOSGuide(true)}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-500/85 dark:border-slate-500 px-3 py-1.5 text-xs font-medium text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
         >
           <Download className="w-3.5 h-3.5" />
           <span>{label}</span>
@@ -46,7 +46,8 @@ export const PWAInstallButton: React.FC<{ label?: string; compact?: boolean }> =
                 <button
                   type="button"
                   onClick={() => setShowIOSGuide(false)}
-                  className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  aria-label="Close"
+                  className="p-1.5 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -77,7 +78,7 @@ export const OfflineIndicator: React.FC = () => {
   if (isOnline) return null;
 
   return (
-    <div className="fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-lg bg-amber-600 px-3 py-2 text-xs font-medium text-white shadow-lg">
+    <div className="fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-lg bg-amber-800 px-3 py-2 text-xs font-medium text-white shadow-lg">
       <WifiOff className="w-3.5 h-3.5" />
       <span>Offline Mode — Reconnecting when network returns</span>
     </div>

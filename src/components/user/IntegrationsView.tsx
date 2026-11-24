@@ -44,7 +44,17 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
   const [pathaoSandbox, setPathaoSandbox] = useState(false);
   const [savingPathao, setSavingPathao] = useState(false);
   const [testingPathao, setTestingPathao] = useState(false);
-  const [shipments, setShipments] = useState<Array<{ id: string; provider: string; tracking_id: string; parcel_status: string; cod_amount: number; created_at: string }>>([]);
+  const [shipments, setShipments] = useState<
+    Array<{
+      id: string;
+      provider: string;
+      tracking_id: string;
+      consignment_id?: string;
+      parcel_status: string;
+      cod_amount: number;
+      created_at: string;
+    }>
+  >([]);
 
   // Meta CAPI state
   const [pixelId, setPixelId] = useState('');
@@ -642,9 +652,14 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
               <div className="divide-y divide-[#E6E0FF]/60 dark:divide-slate-800 text-xs">
                 {shipments.map((s) => (
                   <div key={s.id} className="py-2.5 flex items-center justify-between gap-3">
-                    <div>
-                      <span className="uppercase font-semibold mr-2">{s.provider}</span>
-                      <span className="font-mono">{s.tracking_id}</span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="uppercase font-semibold">{s.provider}</span>
+                      {s.consignment_id && (
+                        <span className="font-mono font-semibold text-emerald-700 dark:text-emerald-400">
+                          Parcel ID: #{s.consignment_id}
+                        </span>
+                      )}
+                      <span className="font-mono text-slate-600 dark:text-slate-300">Track: {s.tracking_id}</span>
                     </div>
                     <div className="flex items-center gap-3">
                       <span className="capitalize">{s.parcel_status}</span>
