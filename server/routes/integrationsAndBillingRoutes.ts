@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
+import { decryptSecret, encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
 import { writeAuditLog } from '../db/repository.ts';
 import { processCustomerMessageWithAi } from '../ai/customerAgent.ts';
 import { requireAuth, requireBusinessAccess, requireFeature, type AuthedRequest } from '../middleware/auth.ts';
@@ -25,11 +25,15 @@ import {
   createMetaOAuthUrl,
   dispatchChannelReply,
   fetchMetaSenderProfile,
+  getInstantAutoReplyDiagnostics,
   getPlatformMetaConfig,
   handleMetaOAuthCallback,
   resolveAppBaseUrl,
   resolveMetaChannelToken,
   sendMetaCapiEvent,
+  sendMetaSenderAction,
+  subscribePageToMetaWebhooks,
+  subscribeWabaToMetaWebhooks,
   syncMetaConversationsForBusiness,
   verifyMetaWebhookBodyWithFallback,
 } from '../services/metaService.ts';
@@ -124,6 +128,84 @@ router.post('/businesses/:businessId/social/sync-inbox', requireAuth, requireBus
     return res.json(result);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to sync Meta inbox.' });
+  }
+});
+
+router.get('/businesses/:businessId/social/webhook-status', requireAuth, requireBusinessAccess('inbox'), async (req: AuthedRequest, res) => {
+  try {
+    const webhookUrl = `${resolveAppBaseUrl(req)}/api/webhooks/meta`;
+    const diagnostics = await getInstantAutoReplyDiagnostics(req.businessId!, webhookUrl);
+    return res.json(diagnostics);
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to inspect webhook status.' });
+  }
+});
+
+router.post('/businesses/:businessId/social/webhook-subscribe', requireAuth, requireBusinessAccess('settings'), async (req: AuthedRequest, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    const businessId = req.businessId!;
+    const metaCfg = await getPlatformMetaConfig();
+    const [{ data: fbPages }, { data: igAccounts }, { data: waAccounts }] = await Promise.all([
+      admin.from('facebook_pages').select('page_id, page_name, page_access_token_encrypted').eq('business_id', businessId).eq('is_active', true),
+      admin.from('instagram_accounts').select('linked_page_id, username, access_token_encrypted').eq('business_id', businessId).eq('is_active', true),
+      admin.from('whatsapp_accounts').select('waba_id, access_token_encrypted').eq('business_id', businessId).eq('is_active', true),
+    ]);
+
+    const subscribedPages: string[] = [];
+    const failedPages: Array<{ name: string; error: string }> = [];
+    const donePageIds = new Set<string>();
+
+    for (const p of fbPages || []) {
+      if (donePageIds.has(p.page_id)) continue;
+      donePageIds.add(p.page_id);
+      const token = decryptSecret(p.page_access_token_encrypted || '');
+      if (!token) continue;
+      const r = await subscribePageToMetaWebhooks({
+        businessId,
+        pageId: p.page_id,
+        pageAccessToken: token,
+        apiVersion: metaCfg.apiVersion,
+      });
+      if (r.ok) subscribedPages.push(p.page_name || p.page_id);
+      else failedPages.push({ name: p.page_name || p.page_id, error: r.error || 'Subscription failed' });
+    }
+
+    for (const ig of igAccounts || []) {
+      if (!ig.linked_page_id || donePageIds.has(ig.linked_page_id)) continue;
+      donePageIds.add(ig.linked_page_id);
+      const token = decryptSecret(ig.access_token_encrypted || '');
+      if (!token) continue;
+      const r = await subscribePageToMetaWebhooks({
+        businessId,
+        pageId: ig.linked_page_id,
+        pageAccessToken: token,
+        apiVersion: metaCfg.apiVersion,
+      });
+      if (r.ok) subscribedPages.push(ig.username || ig.linked_page_id);
+      else failedPages.push({ name: ig.username || ig.linked_page_id, error: r.error || 'Subscription failed' });
+    }
+
+    const doneWabas = new Set<string>();
+    for (const wa of waAccounts || []) {
+      if (!wa.waba_id || doneWabas.has(wa.waba_id)) continue;
+      doneWabas.add(wa.waba_id);
+      const token = decryptSecret(wa.access_token_encrypted || '');
+      if (!token) continue;
+      const r = await subscribeWabaToMetaWebhooks({
+        businessId,
+        wabaId: wa.waba_id,
+        accessToken: token,
+        apiVersion: metaCfg.apiVersion,
+      });
+      if (r.ok) subscribedPages.push(`WhatsApp (${wa.waba_id})`);
+      else failedPages.push({ name: `WhatsApp (${wa.waba_id})`, error: r.error || 'Subscription failed' });
+    }
+
+    const diagnostics = await getInstantAutoReplyDiagnostics(businessId, `${resolveAppBaseUrl(req)}/api/webhooks/meta`);
+    return res.json({ subscribedPages, failedPages, diagnostics });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to subscribe webhooks.' });
   }
 });
 
@@ -231,13 +313,13 @@ router.get(['/oauth/meta/callback', '/oauth/meta/callback/'], async (req, res) =
 // Meta Webhooks Verification & Ingestion (Facebook Messenger, Instagram DM, WhatsApp Cloud API)
 router.get('/webhooks/meta', async (req, res) => {
   try {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+    const mode = String(req.query['hub.mode'] || '').trim();
+    const token = String(req.query['hub.verify_token'] || '').trim();
+    const challenge = String(req.query['hub.challenge'] || '');
 
     const metaCfg = await getPlatformMetaConfig();
-    if (mode === 'subscribe' && token === metaCfg.webhookVerifyToken) {
-      return res.status(200).send(challenge);
+    if (mode === 'subscribe' && token && token === metaCfg.webhookVerifyToken.trim()) {
+      return res.status(200).type('text/plain').send(challenge);
     }
     return res.status(403).send('Forbidden');
   } catch (err) {
@@ -259,27 +341,34 @@ router.post('/webhooks/meta', async (req, res) => {
       return res.status(401).json({ error: sigCheck.reason || 'Invalid Meta webhook signature.' });
     }
 
+    type MetaMessagingEvent = {
+      sender?: { id?: string };
+      recipient?: { id?: string };
+      timestamp?: number;
+      delivery?: { mids?: string[]; watermark?: number };
+      read?: { watermark?: number };
+      message?: {
+        mid?: string;
+        text?: string;
+        is_echo?: boolean;
+        attachments?: Array<{ type?: string; payload?: { url?: string; sticker_id?: number } }>;
+      };
+      postback?: { mid?: string; title?: string; payload?: string };
+    };
+
     const payload = req.body as {
       object?: string;
       entry?: Array<{
         id?: string;
-        messaging?: Array<{
-          sender?: { id?: string };
-          recipient?: { id?: string };
-          timestamp?: number;
-          delivery?: { mids?: string[]; watermark?: number };
-          read?: { watermark?: number };
-          message?: {
-            mid?: string;
-            text?: string;
-            is_echo?: boolean;
-            attachments?: Array<{ type?: string; payload?: { url?: string } }>;
-          };
-          postback?: { mid?: string; title?: string; payload?: string };
-        }>;
+        messaging?: MetaMessagingEvent[];
+        standby?: MetaMessagingEvent[];
         changes?: Array<{
           field?: string;
           value?: {
+            sender?: { id?: string };
+            recipient?: { id?: string };
+            timestamp?: string | number;
+            message?: MetaMessagingEvent['message'];
             metadata?: { phone_number_id?: string };
             contacts?: Array<{ profile?: { name?: string }; wa_id?: string }>;
             messages?: Array<{ id?: string; from?: string; type?: string; text?: { body?: string } }>;
@@ -292,10 +381,29 @@ router.post('/webhooks/meta', async (req, res) => {
     const admin = getSupabaseAdmin();
 
     for (const entry of payload.entry || []) {
+      // Normalize Messenger, Handover standby, and Instagram (messaging + changes.messages) into messaging events
+      const igChangeMessaging: MetaMessagingEvent[] =
+        payload.object === 'instagram' && entry.changes
+          ? entry.changes
+              .filter((c) => c.field === 'messages' && c.value?.sender?.id && c.value?.message)
+              .map((c) => ({
+                sender: c.value!.sender,
+                recipient: c.value!.recipient || { id: entry.id },
+                timestamp: Number(c.value!.timestamp || Date.now()),
+                message: c.value!.message,
+              }))
+          : [];
+
+      const messagingList: MetaMessagingEvent[] = [
+        ...(entry.messaging || []),
+        ...(entry.standby || []),
+        ...igChangeMessaging,
+      ];
+
       // Messenger or Instagram Messaging
-      if (entry.messaging) {
+      if (messagingList.length > 0) {
         const channel = payload.object === 'instagram' ? 'instagram' : 'facebook';
-        for (const msgEvent of entry.messaging) {
+        for (const msgEvent of messagingList) {
           // Handle delivery & read receipts from Meta
           if (msgEvent.delivery || msgEvent.read) {
             const senderId = msgEvent.sender?.id;
@@ -348,7 +456,8 @@ router.post('/webhooks/meta', async (req, res) => {
 
           if (msgEvent.message?.is_echo) continue;
 
-          const incomingAtts = (msgEvent.message?.attachments || [])
+          const rawAttachments = msgEvent.message?.attachments || [];
+          const incomingAtts = rawAttachments
             .map((a) => {
               const rawUrl = a.payload?.url || '';
               if (!rawUrl.startsWith('https://') && !rawUrl.startsWith('http://')) return null;
@@ -363,9 +472,20 @@ router.post('/webhooks/meta', async (req, res) => {
             .filter((v): v is { file_url: string; file_type: string; file_name: string; file_size: number } => Boolean(v));
 
           const hasImageAtt = incomingAtts.some((a) => a.file_type === 'image');
+          const firstNonUrlAttType = rawAttachments.find((a) => !a.payload?.url)?.type;
+          const hasSticker = rawAttachments.some((a) => Boolean(a.payload?.sticker_id));
+          const fallbackAttSummary = hasImageAtt
+            ? '📷 Photo'
+            : incomingAtts.length > 0
+            ? '📎 Attachment'
+            : hasSticker
+            ? '👍 Sticker'
+            : firstNonUrlAttType
+            ? `[${firstNonUrlAttType}]`
+            : '';
+
           const rawText = msgEvent.message?.text?.trim() || msgEvent.postback?.title?.trim() || '';
-          const previewSummary =
-            rawText || (hasImageAtt ? '📷 Photo' : incomingAtts.length > 0 ? '📎 Attachment' : '');
+          const previewSummary = rawText || fallbackAttSummary;
           const mid = msgEvent.message?.mid || msgEvent.postback?.mid || `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const senderId = msgEvent.sender?.id;
           const recipientId = msgEvent.recipient?.id;
@@ -426,6 +546,16 @@ router.post('/webhooks/meta', async (req, res) => {
             payload: msgEvent,
           });
           if (dupErr) continue;
+
+          // Also guard against messages already imported by background inbox sync
+          const { data: existingExternalMsg } = await admin
+            .from('messages')
+            .select('id')
+            .eq('business_id', matchedBusinessId)
+            .eq('external_message_id', mid)
+            .limit(1)
+            .maybeSingle();
+          if (existingExternalMsg) continue;
 
           try {
             let { data: conv } = await admin
@@ -525,8 +655,59 @@ router.post('/webhooks/meta', async (req, res) => {
                 broadcastToBusiness(matchedBusinessId, 'message:new', fullMsg || savedMsg);
               }
 
+              // Immediately show "Seen" & typing dots to the customer while AI generates the instant reply
+              void sendMetaSenderAction({
+                businessId: matchedBusinessId,
+                channel,
+                channelAccountId: matchedAccountId,
+                recipientId: senderId,
+                action: 'mark_seen',
+              });
+              void sendMetaSenderAction({
+                businessId: matchedBusinessId,
+                channel,
+                channelAccountId: matchedAccountId,
+                recipientId: senderId,
+                action: 'typing_on',
+              });
+
+              // If customer sent a quick sticker/image without text, wait 900ms so an immediately-following question coalesces cleanly
+              if (!rawText && savedMsg) {
+                await new Promise((r) => setTimeout(r, 900));
+                const { data: newerCheck } = await admin
+                  .from('messages')
+                  .select('id')
+                  .eq('conversation_id', conv.id)
+                  .gt('created_at', savedMsg.created_at)
+                  .limit(1)
+                  .maybeSingle();
+                if (newerCheck) {
+                  continue;
+                }
+              }
+
+              // Ensure another concurrent webhook hasn't already generated an AI reply for this customer turn
+              if (savedMsg) {
+                const { data: alreadyReplied } = await admin
+                  .from('messages')
+                  .select('id')
+                  .eq('conversation_id', conv.id)
+                  .eq('sender_type', 'ai')
+                  .gte('created_at', savedMsg.created_at)
+                  .limit(1)
+                  .maybeSingle();
+                if (alreadyReplied) {
+                  continue;
+                }
+              }
+
               const aiInputText =
-                rawText || (hasImageAtt ? 'Customer sent an image.' : 'Customer sent a file attachment.');
+                rawText ||
+                (hasSticker
+                  ? 'Customer sent a thumbs-up / sticker reaction.'
+                  : hasImageAtt
+                  ? 'Customer sent an image.'
+                  : `Customer sent ${fallbackAttSummary || 'an attachment'}.`);
               const aiOut = await processCustomerMessageWithAi({
                 businessId: matchedBusinessId,
                 conversationId: conv.id,
@@ -560,22 +741,40 @@ router.post('/webhooks/meta', async (req, res) => {
                   }
                 }
                 if (!dispatch.delivered) {
+                  const warnMsg = dispatch.error || 'Failed to deliver AI reply to Meta.';
                   await admin.from('social_connection_logs').insert({
                     business_id: matchedBusinessId,
                     platform: channel,
                     event_type: 'reply_dispatch_failed',
                     status: 'error',
-                    message: dispatch.error || 'Failed to deliver AI reply to Meta.',
+                    message: warnMsg,
+                  });
+                  broadcastToBusiness(matchedBusinessId, 'ai:warning', {
+                    conversationId: conv.id,
+                    message: warnMsg,
                   });
                 }
-              } else if (aiOut.error) {
-                await admin.from('social_connection_logs').insert({
-                  business_id: matchedBusinessId,
-                  platform: channel,
-                  event_type: 'ai_reply_skipped',
-                  status: 'error',
-                  message: aiOut.error,
+              } else {
+                void sendMetaSenderAction({
+                  businessId: matchedBusinessId,
+                  channel,
+                  channelAccountId: matchedAccountId,
+                  recipientId: senderId,
+                  action: 'typing_off',
                 });
+                if (aiOut.error) {
+                  await admin.from('social_connection_logs').insert({
+                    business_id: matchedBusinessId,
+                    platform: channel,
+                    event_type: 'ai_reply_skipped',
+                    status: 'error',
+                    message: aiOut.error,
+                  });
+                  broadcastToBusiness(matchedBusinessId, 'ai:warning', {
+                    conversationId: conv.id,
+                    message: aiOut.error,
+                  });
+                }
               }
             }
           } catch (msgErr) {
@@ -635,6 +834,15 @@ router.post('/webhooks/meta', async (req, res) => {
               payload: waMsg,
             });
             if (dupErr) continue;
+
+            const { data: existingWaMsg } = await admin
+              .from('messages')
+              .select('id')
+              .eq('business_id', waAcc.business_id)
+              .eq('external_message_id', mid)
+              .limit(1)
+              .maybeSingle();
+            if (existingWaMsg) continue;
 
             try {
               const contactName = val.contacts?.[0]?.profile?.name || `WhatsApp ${from.slice(-4)}`;
@@ -728,12 +936,17 @@ router.post('/webhooks/meta', async (req, res) => {
                     }
                   }
                   if (!dispatch.delivered) {
+                    const warnMsg = dispatch.error || 'Failed to deliver WhatsApp AI reply.';
                     await admin.from('social_connection_logs').insert({
                       business_id: waAcc.business_id,
                       platform: 'whatsapp',
                       event_type: 'reply_dispatch_failed',
                       status: 'error',
-                      message: dispatch.error || 'Failed to deliver WhatsApp AI reply.',
+                      message: warnMsg,
+                    });
+                    broadcastToBusiness(waAcc.business_id, 'ai:warning', {
+                      conversationId: conv.id,
+                      message: warnMsg,
                     });
                   }
                 } else if (aiOut.error) {
@@ -742,6 +955,10 @@ router.post('/webhooks/meta', async (req, res) => {
                     platform: 'whatsapp',
                     event_type: 'ai_reply_skipped',
                     status: 'error',
+                    message: aiOut.error,
+                  });
+                  broadcastToBusiness(waAcc.business_id, 'ai:warning', {
+                    conversationId: conv.id,
                     message: aiOut.error,
                   });
                 }

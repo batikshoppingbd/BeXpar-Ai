@@ -194,6 +194,7 @@ export async function ensureDefaultAiProvidersAndModels(): Promise<void> {
       if (onlyRetiredOrEmpty || hasRetiredDefault) {
         const primaryTpl = DEFAULT_MODEL_BY_TYPE.gemini[0];
         const fallbackTpl = DEFAULT_MODEL_BY_TYPE.gemini[1];
+        const liteTpl = DEFAULT_MODEL_BY_TYPE.gemini[2];
 
         for (const retiredId of retiredGeminiIds) {
           if (geminiModels.some((m) => String(m.model_id) === retiredId)) {
@@ -237,6 +238,20 @@ export async function ensureDefaultAiProvidersAndModels(): Promise<void> {
               output_cost_per_1m: fallbackTpl.output_cost_per_1m,
               coins_per_usd: 1000,
               max_tokens: fallbackTpl.max_tokens,
+              min_plan_slug: 'free',
+            },
+            {
+              provider_id: geminiProv.id,
+              model_id: liteTpl.model_id,
+              display_name: liteTpl.display_name,
+              is_active: true,
+              is_default: false,
+              is_fallback: true,
+              priority: liteTpl.priority,
+              input_cost_per_1m: liteTpl.input_cost_per_1m,
+              output_cost_per_1m: liteTpl.output_cost_per_1m,
+              coins_per_usd: 1000,
+              max_tokens: liteTpl.max_tokens,
               min_plan_slug: 'free',
             },
           ],
@@ -292,7 +307,14 @@ export async function getOrderedActiveModels(): Promise<AiModelConfig[]> {
       .order('priority', { ascending: true });
 
   let { data, error } = await queryModels();
-  if (!error && (!data || data.length === 0)) {
+  const retiredCheck = new Set(['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-2.0-pro']);
+  const needsAutoHeal =
+    !error &&
+    (!data ||
+      data.length === 0 ||
+      data.some((m) => Boolean((m as unknown as AiModelConfig).is_default) && retiredCheck.has(String(m.model_id))));
+
+  if (needsAutoHeal) {
     await ensureDefaultAiProvidersAndModels();
     const retry = await queryModels();
     data = retry.data;
@@ -386,13 +408,31 @@ async function callSingleModel(
         },
       });
 
+    const callWithRetry = async (fn: () => Promise<{ text?: string; usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } }>) => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          return await fn();
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = /429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|overloaded|rate.?limit/i.test(msg);
+          if (!isTransient || attempt === 1) throw err;
+          await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+        }
+      }
+      throw lastErr;
+    };
+
     let response;
     try {
-      response = await runGemini(Boolean(params.expectJson));
+      response = await callWithRetry(() => runGemini(Boolean(params.expectJson)));
     } catch (err) {
-      if (params.expectJson) {
-        // Retry without strict responseSchema in case the model doesn't support structured schema
-        response = await runGemini(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      const isSchemaError = /schema|response_mime_type|responseMimeType|INVALID_ARGUMENT|400/i.test(msg);
+      if (params.expectJson && isSchemaError) {
+        // Retry without strict responseSchema only if the model rejected JSON schema
+        response = await callWithRetry(() => runGemini(false));
       } else {
         throw err;
       }

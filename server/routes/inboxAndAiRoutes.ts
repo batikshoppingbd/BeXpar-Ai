@@ -186,7 +186,56 @@ router.get('/businesses/:businessId/conversations/:conversationId/messages', req
         .neq('delivery_status', 'read'),
     ]);
 
-    return res.json({ messages: data || [] });
+    let latestAiWarning = '';
+    const msgs = data || [];
+    const latestMsg = msgs[msgs.length - 1] as { sender_type?: string; created_at?: string } | undefined;
+    if (latestMsg?.sender_type === 'customer') {
+      const [{ data: convRow }, { data: aiSettings }, { data: recentUsageErr }, { data: recentConnErr }] =
+        await Promise.all([
+          admin
+            .from('conversations')
+            .select('ai_enabled')
+            .eq('id', req.params.conversationId)
+            .eq('business_id', req.businessId!)
+            .maybeSingle(),
+          admin
+            .from('ai_settings')
+            .select('auto_reply_enabled')
+            .eq('business_id', req.businessId!)
+            .maybeSingle(),
+          admin
+            .from('ai_usage_logs')
+            .select('status, error_message, created_at')
+            .eq('business_id', req.businessId!)
+            .eq('conversation_id', req.params.conversationId)
+            .in('status', ['error', 'blocked_insufficient_coins'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          admin
+            .from('social_connection_logs')
+            .select('message, created_at')
+            .eq('business_id', req.businessId!)
+            .eq('status', 'error')
+            .in('event_type', ['ai_reply_skipped', 'reply_dispatch_failed'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
+
+      const msgTime = latestMsg.created_at ? new Date(latestMsg.created_at).getTime() - 10_000 : 0;
+      if (convRow && convRow.ai_enabled === false) {
+        latestAiWarning = 'এই চ্যাটে AI অটো-রিপ্লাই বন্ধ (Manual Mode) আছে। উপরে "AI চালু করুন" চাপুন অথবা ম্যানুয়ালি উত্তর দিন।';
+      } else if (aiSettings && aiSettings.auto_reply_enabled === false) {
+        latestAiWarning = 'AI Settings-এ গ্লোবাল Auto-Reply বন্ধ করা আছে।';
+      } else if (recentUsageErr?.error_message && new Date(recentUsageErr.created_at).getTime() >= msgTime) {
+        latestAiWarning = recentUsageErr.error_message;
+      } else if (recentConnErr?.message && new Date(recentConnErr.created_at).getTime() >= msgTime) {
+        latestAiWarning = recentConnErr.message;
+      }
+    }
+
+    return res.json({ messages: msgs, latestAiWarning });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load messages.' });
   }

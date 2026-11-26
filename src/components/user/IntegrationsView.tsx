@@ -75,6 +75,21 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
     logs: Array<{ id: string; platform: string; event_type: string; status: string; message: string; created_at: string }>;
   } | null>(null);
   const [syncingSocial, setSyncingSocial] = useState(false);
+  const [subscribingWebhook, setSubscribingWebhook] = useState(false);
+  const [webhookDiag, setWebhookDiag] = useState<{
+    ready: boolean;
+    metaConfigured: boolean;
+    webhookUrl: string;
+    webhookVerifyToken: string;
+    totalAccounts: number;
+    subscribedPages: number;
+    hasValidAiKey: boolean;
+    autoReplyEnabled: boolean;
+    coinBalance: number;
+    webhookEvents24h: number;
+    lastWebhookAt: string | null;
+    issues: string[];
+  } | null>(null);
 
   // Courier state
   const [steadfastAccount, setSteadfastAccount] = useState<SafeCourierAccount | null>(null);
@@ -138,7 +153,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
     setLoading(true);
     setError('');
     try {
-      const [soc, cour, capi] = await Promise.all([
+      const [soc, cour, capi, diag] = await Promise.all([
         apiFetch<NonNullable<typeof socialData>>(`/api/businesses/${business.id}/social`, { businessId: business.id }),
         apiFetch<{ accounts: SafeCourierAccount[]; defaultProvider?: 'steadfast' | 'pathao' | null; shipments: typeof shipments }>(
           `/api/businesses/${business.id}/couriers`,
@@ -147,8 +162,12 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
         apiFetch<{ config: Record<string, unknown> | null; events: typeof capiEvents }>(`/api/businesses/${business.id}/capi`, {
           businessId: business.id,
         }),
+        apiFetch<NonNullable<typeof webhookDiag>>(`/api/businesses/${business.id}/social/webhook-status`, {
+          businessId: business.id,
+        }).catch(() => null),
       ]);
       setSocialData(soc);
+      setWebhookDiag(diag);
       setShipments(cour.shipments || []);
       setDefaultCourier(cour.defaultProvider || null);
 
@@ -287,6 +306,37 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
       setError(err instanceof Error ? err.message : 'Failed to sync Meta webhooks & chats.');
     } finally {
       setSyncingSocial(false);
+    }
+  };
+
+  const handleEnableInstantWebhook = async () => {
+    setError('');
+    setNotice('');
+    setSubscribingWebhook(true);
+    try {
+      const res = await apiFetch<{
+        subscribedPages: string[];
+        failedPages: Array<{ name: string; error: string }>;
+        diagnostics: NonNullable<typeof webhookDiag>;
+      }>(`/api/businesses/${business.id}/social/webhook-subscribe`, {
+        method: 'POST',
+        businessId: business.id,
+      });
+      setWebhookDiag(res.diagnostics);
+      await loadData();
+      if (res.failedPages?.length) {
+        setError(res.failedPages.map((f) => `${f.name}: ${f.error}`).join(' | '));
+      } else {
+        setNotice(
+          lang === 'bn'
+            ? `ইনস্ট্যান্ট অটো-রিপ্লাই Webhook সক্রিয় হয়েছে (${res.subscribedPages.join(', ') || 'All channels'})। এখন কাস্টমার মেসেজ দেওয়া মাত্রই রিপ্লাই যাবে!`
+            : `Instant auto-reply webhook subscribed (${res.subscribedPages.join(', ') || 'All channels'}).`
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to enable instant webhook.');
+    } finally {
+      setSubscribingWebhook(false);
     }
   };
 
@@ -727,27 +777,79 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
             </div>
 
             {socialData?.webhookUrl && (
-              <div className="rounded-xl bg-[#F8F9FC] dark:bg-slate-950 border border-[#E6E0FF] dark:border-slate-800 p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
-                <div className="min-w-0">
-                  <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">Meta Webhook Callback URL</div>
-                  <div className="font-mono text-slate-800 dark:text-slate-200 truncate">{socialData.webhookUrl}</div>
+              <div className="rounded-xl bg-[#F8F9FC] dark:bg-slate-950 border border-[#E6E0FF] dark:border-slate-800 p-3.5 space-y-2.5 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+                      <span>{lang === 'bn' ? 'Instant Auto-Reply Webhook সিস্টেম' : 'Instant Auto-Reply Webhook System'}</span>
+                      {webhookDiag && (
+                        <span
+                          className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                            webhookDiag.ready
+                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                              : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                          }`}
+                        >
+                          {webhookDiag.ready
+                            ? lang === 'bn' ? 'ইনস্ট্যান্ট রিপ্লাই চালু' : 'Ready (Instant)'
+                            : lang === 'bn' ? 'সেটআপ অসম্পূর্ণ' : 'Needs Attention'}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Callback URL: <span className="font-mono text-slate-800 dark:text-slate-200">{socialData.webhookUrl}</span>
+                      {webhookDiag?.webhookVerifyToken ? (
+                        <>
+                          {' '}· Verify Token: <span className="font-mono text-slate-800 dark:text-slate-200">{webhookDiag.webhookVerifyToken}</span>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={subscribingWebhook}
+                      onClick={() => void handleEnableInstantWebhook()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#5B35F5] text-white font-semibold hover:bg-[#4924DE] disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${subscribingWebhook ? 'animate-spin' : ''}`} />
+                      <span>{lang === 'bn' ? 'Instant Webhook চালু করুন' : 'Enable Instant Webhook'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(socialData.webhookUrl!);
+                          setCopiedCred('meta-webhook');
+                          setTimeout(() => setCopiedCred((p) => (p === 'meta-webhook' ? null : p)), 1800);
+                        } catch {
+                          setError('Clipboard copy failed.');
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-[#E6E0FF] dark:border-slate-700 font-semibold hover:bg-white dark:hover:bg-slate-800"
+                    >
+                      {copiedCred === 'meta-webhook' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copiedCred === 'meta-webhook' ? 'Copied' : 'Copy URL'}</span>
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      await navigator.clipboard.writeText(socialData.webhookUrl!);
-                      setCopiedCred('meta-webhook');
-                      setTimeout(() => setCopiedCred((p) => (p === 'meta-webhook' ? null : p)), 1800);
-                    } catch {
-                      setError('Clipboard copy failed.');
-                    }
-                  }}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-[#E6E0FF] dark:border-slate-700 text-xs font-semibold hover:bg-white dark:hover:bg-slate-800 shrink-0"
-                >
-                  {copiedCred === 'meta-webhook' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedCred === 'meta-webhook' ? 'Copied' : 'Copy URL'}</span>
-                </button>
+
+                {webhookDiag && (
+                  <div className="flex flex-wrap gap-3 text-[11px] text-slate-600 dark:text-slate-400 pt-1 border-t border-[#E6E0FF]/60 dark:border-slate-800">
+                    <span>AI Key: <strong>{webhookDiag.hasValidAiKey ? '✓ Active' : '✗ Missing'}</strong></span>
+                    <span>Auto-Reply: <strong>{webhookDiag.autoReplyEnabled ? '✓ On' : '✗ Off'}</strong></span>
+                    <span>AI Coins: <strong>{webhookDiag.coinBalance}</strong></span>
+                    <span>24h Webhooks: <strong>{webhookDiag.webhookEvents24h}</strong></span>
+                  </div>
+                )}
+
+                {webhookDiag && webhookDiag.issues.length > 0 && (
+                  <div className="text-[11px] text-amber-700 dark:text-amber-300 space-y-0.5">
+                    {webhookDiag.issues.map((iss, idx) => (
+                      <div key={idx}>• {iss}</div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

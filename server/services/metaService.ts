@@ -72,42 +72,52 @@ export async function subscribePageToMetaWebhooks(params: {
   pageId: string;
   pageAccessToken: string;
   apiVersion?: string;
-}): Promise<{ ok: boolean; error?: string }> {
+}): Promise<{ ok: boolean; subscribedFields?: string; error?: string }> {
   const admin = getSupabaseAdmin();
   const metaCfg = await getPlatformMetaConfig();
   const ver = params.apiVersion || metaCfg.apiVersion;
 
-  try {
-    const subUrl = new URL(`https://graph.facebook.com/${ver}/${params.pageId}/subscribed_apps`);
-    subUrl.searchParams.set(
-      'subscribed_fields',
-      'messages,messaging_postbacks,message_deliveries,message_reads,messaging_optins,feed'
-    );
-    subUrl.searchParams.set('access_token', params.pageAccessToken);
+  const fieldCandidates = [
+    'messages,messaging_postbacks,message_deliveries,message_reads,messaging_optins',
+    'messages,messaging_postbacks,message_deliveries,message_reads',
+    'messages,messaging_postbacks',
+    'messages',
+  ];
 
-    const res = await fetch(subUrl.toString(), { method: 'POST' });
-    const json = (await res.json()) as { success?: boolean; error?: { message?: string } };
-    const ok = Boolean(res.ok && json.success);
+  let lastErr = '';
+  try {
+    for (const fields of fieldCandidates) {
+      const subUrl = new URL(`https://graph.facebook.com/${ver}/${params.pageId}/subscribed_apps`);
+      subUrl.searchParams.set('subscribed_fields', fields);
+      subUrl.searchParams.set('access_token', params.pageAccessToken);
+
+      const res = await fetch(subUrl.toString(), { method: 'POST' });
+      const json = (await res.json()) as { success?: boolean; error?: { message?: string } };
+      if (res.ok && json.success) {
+        await admin
+          .from('facebook_pages')
+          .update({ webhook_subscribed: true })
+          .eq('business_id', params.businessId)
+          .eq('page_id', params.pageId);
+        return { ok: true, subscribedFields: fields };
+      }
+      lastErr = json.error?.message || `HTTP ${res.status}`;
+    }
 
     await admin
       .from('facebook_pages')
-      .update({ webhook_subscribed: ok })
+      .update({ webhook_subscribed: false })
       .eq('business_id', params.businessId)
       .eq('page_id', params.pageId);
 
-    if (!ok) {
-      const errMsg = json.error?.message || `HTTP ${res.status}`;
-      await admin.from('social_connection_logs').insert({
-        business_id: params.businessId,
-        platform: 'facebook',
-        event_type: 'webhook_subscribe',
-        status: 'warning',
-        message: `Webhook subscription note for Page ${params.pageId}: ${errMsg}`,
-      });
-      return { ok: false, error: errMsg };
-    }
-
-    return { ok: true };
+    await admin.from('social_connection_logs').insert({
+      business_id: params.businessId,
+      platform: 'facebook',
+      event_type: 'webhook_subscribe',
+      status: 'warning',
+      message: `Webhook subscription note for Page ${params.pageId}: ${lastErr}`,
+    });
+    return { ok: false, error: lastErr };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     await admin.from('social_connection_logs').insert({
@@ -730,6 +740,37 @@ function sanitizeSafeHttpUrl(raw?: string): string {
   return '';
 }
 
+export async function sendMetaSenderAction(params: {
+  businessId: string;
+  channel: 'facebook' | 'instagram';
+  channelAccountId: string;
+  recipientId: string;
+  action: 'mark_seen' | 'typing_on' | 'typing_off';
+}): Promise<void> {
+  try {
+    const [{ token }, metaCfg] = await Promise.all([
+      resolveMetaChannelToken({
+        businessId: params.businessId,
+        channel: params.channel,
+        channelAccountId: params.channelAccountId,
+      }),
+      getPlatformMetaConfig(),
+    ]);
+    if (!token) return;
+    const endpoint = `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`;
+    await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recipient: { id: params.recipientId },
+        sender_action: params.action,
+      }),
+    });
+  } catch {
+    // Best-effort instant UI indicator; never block reply dispatch
+  }
+}
+
 export async function dispatchChannelReply(params: {
   businessId: string;
   channel: 'facebook' | 'instagram' | 'whatsapp' | 'web_test';
@@ -1098,6 +1139,17 @@ export async function syncMetaConversationsForBusiness(
           if (senderType === 'customer') {
             addedNewCustomerMsg = true;
             newestUnansweredText = text || (hasImg ? 'Customer sent an image.' : 'Customer sent an attachment.');
+            await admin
+              .from('social_webhook_events')
+              .upsert(
+                {
+                  business_id: businessId,
+                  platform: params.channel,
+                  event_id: `${params.channel}_${m.id}`,
+                  payload: { synced: true, messageId: m.id },
+                },
+                { onConflict: 'event_id', ignoreDuplicates: true }
+              );
           } else {
             addedNewCustomerMsg = false;
             newestUnansweredText = '';
@@ -1105,54 +1157,88 @@ export async function syncMetaConversationsForBusiness(
         }
       }
 
-      if (latestText) {
+      if (latestText && new Date(latestAt).getTime() >= new Date(conv.last_message_at || 0).getTime()) {
         await admin
           .from('conversations')
           .update({ last_message: latestText, last_message_at: latestAt })
           .eq('id', conv.id);
       }
 
-      // If requested and the latest message in the thread is a fresh unanswered customer message (within 20 mins), trigger AI auto-reply
-      if (
-        options?.triggerAutoReply &&
-        addedNewCustomerMsg &&
-        newestUnansweredText &&
-        latestAt &&
-        Date.now() - new Date(latestAt).getTime() < 20 * 60 * 1000
-      ) {
-        const aiOut = await processCustomerMessageWithAi({
-          businessId,
-          conversationId: conv.id,
-          customerMessage: newestUnansweredText,
-        });
-        if (aiOut.replied && aiOut.replyText) {
-          const sent = await dispatchChannelReply({
+      // Check the actual latest message in DB so unanswered customer messages (including ones saved during an earlier failed attempt) still get AI auto-reply.
+      // For pre-existing DB messages not inserted by this sync pass, wait 6s so an in-flight instant webhook isn't raced.
+      if (options?.triggerAutoReply && conv.ai_enabled !== false) {
+        const { data: latestDbMsgs } = await admin
+          .from('messages')
+          .select('id, sender_type, content, message_type, created_at')
+          .eq('conversation_id', conv.id)
+          .order('created_at', { ascending: false })
+          .limit(2);
+
+        const latestDbMsg = latestDbMsgs?.[0];
+        const msgAgeMs = latestDbMsg ? Date.now() - new Date(latestDbMsg.created_at).getTime() : Infinity;
+        const isLatestUnansweredCustomer =
+          latestDbMsg &&
+          latestDbMsg.sender_type === 'customer' &&
+          msgAgeMs < 30 * 60 * 1000 &&
+          (addedNewCustomerMsg || msgAgeMs >= 6000);
+
+        const replyPromptText = isLatestUnansweredCustomer
+          ? (latestDbMsg.content || '').trim() ||
+            (latestDbMsg.message_type === 'image' ? 'Customer sent an image.' : 'Customer sent an attachment.')
+          : addedNewCustomerMsg && latestAt && Date.now() - new Date(latestAt).getTime() < 30 * 60 * 1000
+          ? newestUnansweredText
+          : '';
+
+        if (isLatestUnansweredCustomer && replyPromptText) {
+          const aiOut = await processCustomerMessageWithAi({
             businessId,
-            channel: params.channel,
-            channelAccountId: params.channelAccountId,
-            recipientId: customerId,
-            text: aiOut.replyText,
+            conversationId: conv.id,
+            customerMessage: replyPromptText,
           });
-          if (aiOut.messageId) {
-            if (sent.delivered && sent.externalMessageId) {
-              await admin
-                .from('messages')
-                .update({ external_message_id: sent.externalMessageId })
-                .eq('id', aiOut.messageId);
-            } else if (!sent.delivered) {
-              await admin
-                .from('messages')
-                .update({ delivery_status: 'failed' })
-                .eq('id', aiOut.messageId);
+          if (aiOut.replied && aiOut.replyText) {
+            const sent = await dispatchChannelReply({
+              businessId,
+              channel: params.channel,
+              channelAccountId: params.channelAccountId,
+              recipientId: customerId,
+              text: aiOut.replyText,
+            });
+            if (aiOut.messageId) {
+              if (sent.delivered && sent.externalMessageId) {
+                await admin
+                  .from('messages')
+                  .update({ external_message_id: sent.externalMessageId })
+                  .eq('id', aiOut.messageId);
+              } else if (!sent.delivered) {
+                await admin
+                  .from('messages')
+                  .update({ delivery_status: 'failed' })
+                  .eq('id', aiOut.messageId);
+                broadcastToBusiness(businessId, 'message:status', {
+                  conversationId: conv.id,
+                  messageId: aiOut.messageId,
+                  status: 'failed',
+                });
+              }
             }
+            if (sent.delivered) {
+              aiRepliesSent += 1;
+            } else if (sent.error) {
+              const warnText = `AI reply send failed (${params.channel}): ${sent.error}`;
+              warnings.push(warnText);
+              broadcastToBusiness(businessId, 'ai:warning', {
+                conversationId: conv.id,
+                message: warnText,
+              });
+            }
+          } else if (aiOut.error) {
+            const warnText = `AI auto-reply skipped: ${aiOut.error}`;
+            warnings.push(warnText);
+            broadcastToBusiness(businessId, 'ai:warning', {
+              conversationId: conv.id,
+              message: aiOut.error,
+            });
           }
-          if (sent.delivered) {
-            aiRepliesSent += 1;
-          } else if (sent.error) {
-            warnings.push(`AI reply send failed (${params.channel}): ${sent.error}`);
-          }
-        } else if (aiOut.error) {
-          warnings.push(`AI auto-reply skipped: ${aiOut.error}`);
         }
       }
     }
@@ -1189,5 +1275,88 @@ export async function syncMetaConversationsForBusiness(
     aiRepliesSent,
     webhookSubscribedPages,
     warnings,
+  };
+}
+
+export async function getInstantAutoReplyDiagnostics(businessId: string, webhookUrl: string) {
+  const admin = getSupabaseAdmin();
+  const metaCfg = await getPlatformMetaConfig();
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const [
+    { data: fbPages },
+    { data: igAccounts },
+    { data: waAccounts },
+    { data: aiSettings },
+    { data: wallet },
+    { data: activeModels },
+    { data: recentEvents },
+  ] = await Promise.all([
+    admin.from('facebook_pages').select('page_id, page_name, webhook_subscribed, is_active').eq('business_id', businessId).eq('is_active', true),
+    admin.from('instagram_accounts').select('ig_account_id, username, linked_page_id, is_active').eq('business_id', businessId).eq('is_active', true),
+    admin.from('whatsapp_accounts').select('phone_number_id, display_phone_number, webhook_configured, is_active').eq('business_id', businessId).eq('is_active', true),
+    admin.from('ai_settings').select('auto_reply_enabled, is_available').eq('business_id', businessId).maybeSingle(),
+    admin.from('coin_wallets').select('balance').eq('business_id', businessId).maybeSingle(),
+    admin
+      .from('ai_models')
+      .select('model_id, provider:ai_providers!inner(slug, provider_type, api_key_encrypted, is_active)')
+      .eq('is_active', true)
+      .eq('provider.is_active', true),
+    admin
+      .from('social_webhook_events')
+      .select('created_at')
+      .eq('business_id', businessId)
+      .gte('created_at', since24h)
+      .order('created_at', { ascending: false })
+      .limit(25),
+  ]);
+
+  const hasValidAiKey = (activeModels || []).some((m) => {
+    const prov = (m as unknown as { provider?: { provider_type?: string; api_key_encrypted?: string } }).provider;
+    const dec = decryptSecret(prov?.api_key_encrypted || '');
+    if (dec) return true;
+    return prov?.provider_type === 'gemini' && Boolean(process.env.GEMINI_API_KEY);
+  });
+
+  const coinBalance = Number(wallet?.balance || 0);
+  const autoReplyEnabled = aiSettings ? aiSettings.auto_reply_enabled !== false && aiSettings.is_available !== false : true;
+  const connectedPages = fbPages || [];
+  const connectedIg = igAccounts || [];
+  const connectedWa = waAccounts || [];
+  const subscribedPages = connectedPages.filter((p) => p.webhook_subscribed).length + connectedWa.filter((w) => w.webhook_configured).length;
+  const totalAccounts = connectedPages.length + connectedIg.length + connectedWa.length;
+
+  const issues: string[] = [];
+  if (!metaCfg.appId || !metaCfg.appSecret) {
+    issues.push('Meta App ID ও App Secret সেট করা নেই (Super Admin → Platform Settings → Meta Platform API)।');
+  }
+  if (totalAccounts === 0) {
+    issues.push('কোনো Facebook Page, Instagram বা WhatsApp অ্যাকাউন্ট কানেক্ট করা নেই।');
+  } else if (connectedPages.some((p) => !p.webhook_subscribed) || connectedWa.some((w) => !w.webhook_configured)) {
+    issues.push('পেজের Meta Webhook সাবস্ক্রিপশন বাকি আছে — "Enable Instant Webhook" চাপুন।');
+  }
+  if (!hasValidAiKey) {
+    issues.push('কোনো সক্রিয় AI Provider API Key সেট করা নেই।');
+  }
+  if (!autoReplyEnabled) {
+    issues.push('AI Studio Settings-এ Auto-Reply বন্ধ আছে।');
+  }
+  if (coinBalance <= 0) {
+    issues.push('AI Coin ব্যালেন্স ০ — অটো-রিপ্লাইয়ের জন্য কয়েন রিচার্জ করুন।');
+  }
+
+  return {
+    ready: issues.length === 0,
+    metaConfigured: Boolean(metaCfg.appId && metaCfg.appSecret),
+    webhookUrl,
+    webhookVerifyToken: metaCfg.webhookVerifyToken,
+    totalAccounts,
+    subscribedPages,
+    hasValidAiKey,
+    autoReplyEnabled,
+    coinBalance,
+    webhookEvents24h: (recentEvents || []).length,
+    lastWebhookAt: recentEvents?.[0]?.created_at || null,
+    issues,
   };
 }

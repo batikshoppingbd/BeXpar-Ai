@@ -1994,6 +1994,7 @@ async function ensureDefaultAiProvidersAndModels() {
       if (onlyRetiredOrEmpty || hasRetiredDefault) {
         const primaryTpl = DEFAULT_MODEL_BY_TYPE.gemini[0];
         const fallbackTpl = DEFAULT_MODEL_BY_TYPE.gemini[1];
+        const liteTpl = DEFAULT_MODEL_BY_TYPE.gemini[2];
         for (const retiredId of retiredGeminiIds) {
           if (geminiModels.some((m) => String(m.model_id) === retiredId)) {
             await admin.from("ai_models").update({ is_active: false, is_default: false, is_fallback: false }).eq("provider_id", geminiProv.id).eq("model_id", retiredId);
@@ -2030,6 +2031,20 @@ async function ensureDefaultAiProvidersAndModels() {
               output_cost_per_1m: fallbackTpl.output_cost_per_1m,
               coins_per_usd: 1e3,
               max_tokens: fallbackTpl.max_tokens,
+              min_plan_slug: "free"
+            },
+            {
+              provider_id: geminiProv.id,
+              model_id: liteTpl.model_id,
+              display_name: liteTpl.display_name,
+              is_active: true,
+              is_default: false,
+              is_fallback: true,
+              priority: liteTpl.priority,
+              input_cost_per_1m: liteTpl.input_cost_per_1m,
+              output_cost_per_1m: liteTpl.output_cost_per_1m,
+              coins_per_usd: 1e3,
+              max_tokens: liteTpl.max_tokens,
               min_plan_slug: "free"
             }
           ],
@@ -2069,7 +2084,9 @@ async function getOrderedActiveModels() {
   const admin = getSupabaseAdmin();
   const queryModels = async () => admin.from("ai_models").select("*, provider:ai_providers!inner(*)").eq("is_active", true).eq("provider.is_active", true).order("is_default", { ascending: false }).order("priority", { ascending: true });
   let { data, error } = await queryModels();
-  if (!error && (!data || data.length === 0)) {
+  const retiredCheck = /* @__PURE__ */ new Set(["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-pro"]);
+  const needsAutoHeal = !error && (!data || data.length === 0 || data.some((m) => Boolean(m.is_default) && retiredCheck.has(String(m.model_id))));
+  if (needsAutoHeal) {
     await ensureDefaultAiProvidersAndModels();
     const retry = await queryModels();
     data = retry.data;
@@ -2144,12 +2161,29 @@ async function callSingleModel(model, params) {
         } : {}
       }
     });
+    const callWithRetry = async (fn) => {
+      let lastErr;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          return await fn();
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = /429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|overloaded|rate.?limit/i.test(msg);
+          if (!isTransient || attempt === 1) throw err;
+          await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+        }
+      }
+      throw lastErr;
+    };
     let response;
     try {
-      response = await runGemini(Boolean(params.expectJson));
+      response = await callWithRetry(() => runGemini(Boolean(params.expectJson)));
     } catch (err) {
-      if (params.expectJson) {
-        response = await runGemini(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      const isSchemaError = /schema|response_mime_type|responseMimeType|INVALID_ARGUMENT|400/i.test(msg);
+      if (params.expectJson && isSchemaError) {
+        response = await callWithRetry(() => runGemini(false));
       } else {
         throw err;
       }
@@ -2383,6 +2417,16 @@ async function processCustomerMessageWithAi(params) {
     admin.from("messages").select("sender_type, content, created_at").eq("conversation_id", params.conversationId).order("created_at", { ascending: false }).limit(12)
   ]);
   const orderedHistory = (history || []).reverse();
+  const trailingCustomerMsgs = [];
+  for (let i = orderedHistory.length - 1; i >= 0; i--) {
+    if (orderedHistory[i].sender_type === "customer") {
+      const txt = String(orderedHistory[i].content || "").trim();
+      if (txt) trailingCustomerMsgs.unshift(txt);
+    } else {
+      break;
+    }
+  }
+  const combinedLatestCustomerMsg = trailingCustomerMsgs.length > 1 ? trailingCustomerMsgs.join("\n") : params.customerMessage;
   const defaultDelivery = Number(aiSettings?.order_collection_rules?.default_delivery_charge ?? 60);
   const systemInstruction = `You are "${aiSettings?.agent_name || "BeXpar Assistant"}", the official AI Customer Service & Sales Agent for "${business?.name || "our store"}" (${business?.category || ""}) on channel: ${conv.channel}.
 
@@ -2398,6 +2442,12 @@ STRICT ACCURACY & GROUNDING RULES (NEVER VIOLATE):
 4. For orders: collect missing required fields (Customer Name, Phone Number, Full Delivery Address, Product, Quantity, Color/Size if product has variants). Ask ONLY for missing information.
 5. Set "extracted_order.ready_to_create": true ONLY when you have Customer Name, valid Phone Number, Full Delivery Address, and at least one matched product_id from the catalog with stock > 0, and the customer has confirmed or clearly placed the order.
 6. Standard default delivery charge (unless specified in Knowledge Base): ${defaultDelivery} BDT.
+
+STORE CONTACT & LOCATION:
+- Store Name: ${business?.name || "Our Store"}
+- Category: ${business?.category || "General"}
+- Phone: ${business?.phone || "Not provided"}
+- Address / Location: ${business?.address || "Not provided"}
 
 CUSTOM BUSINESS INSTRUCTIONS:
 ${aiSettings?.system_instructions || "Be helpful, polite, and accurate."}
@@ -2427,7 +2477,7 @@ RETURN STRICT JSON ONLY matching this schema:
 ${orderedHistory.map((m) => `[${m.sender_type.toUpperCase()}]: ${m.content}`).join("\n")}
 
 LATEST CUSTOMER MESSAGE:
-${params.customerMessage}`;
+${combinedLatestCustomerMsg}`;
   let genResult;
   try {
     genResult = await generateWithRouter({
@@ -2521,13 +2571,19 @@ ${params.customerMessage}`;
       intent: parsed.intent
     }
   }).select("*").single();
-  await admin.from("conversations").update({
+  const shouldPauseAi = Boolean(
+    parsed.should_handover && parsed.intent === "human_handover" && aiSettings?.human_handover_enabled
+  );
+  const { data: updatedConv } = await admin.from("conversations").update({
     last_message: parsed.reply_text,
     last_message_at: (/* @__PURE__ */ new Date()).toISOString(),
-    ...parsed.should_handover && aiSettings?.human_handover_enabled ? { ai_enabled: false } : {}
-  }).eq("id", params.conversationId);
+    ...shouldPauseAi ? { ai_enabled: false } : {}
+  }).eq("id", params.conversationId).select("*, customer:customers(*)").single();
   if (savedAiMsg) {
     broadcastToBusiness(params.businessId, "message:new", savedAiMsg);
+  }
+  if (updatedConv) {
+    broadcastToBusiness(params.businessId, "conversation:updated", updatedConv);
   }
   let orderCreatedId;
   const orderData = parsed.extracted_order;
@@ -2674,29 +2730,35 @@ async function subscribePageToMetaWebhooks(params) {
   const admin = getSupabaseAdmin();
   const metaCfg = await getPlatformMetaConfig();
   const ver = params.apiVersion || metaCfg.apiVersion;
+  const fieldCandidates = [
+    "messages,messaging_postbacks,message_deliveries,message_reads,messaging_optins",
+    "messages,messaging_postbacks,message_deliveries,message_reads",
+    "messages,messaging_postbacks",
+    "messages"
+  ];
+  let lastErr = "";
   try {
-    const subUrl = new URL(`https://graph.facebook.com/${ver}/${params.pageId}/subscribed_apps`);
-    subUrl.searchParams.set(
-      "subscribed_fields",
-      "messages,messaging_postbacks,message_deliveries,message_reads,messaging_optins,feed"
-    );
-    subUrl.searchParams.set("access_token", params.pageAccessToken);
-    const res = await fetch(subUrl.toString(), { method: "POST" });
-    const json = await res.json();
-    const ok = Boolean(res.ok && json.success);
-    await admin.from("facebook_pages").update({ webhook_subscribed: ok }).eq("business_id", params.businessId).eq("page_id", params.pageId);
-    if (!ok) {
-      const errMsg = json.error?.message || `HTTP ${res.status}`;
-      await admin.from("social_connection_logs").insert({
-        business_id: params.businessId,
-        platform: "facebook",
-        event_type: "webhook_subscribe",
-        status: "warning",
-        message: `Webhook subscription note for Page ${params.pageId}: ${errMsg}`
-      });
-      return { ok: false, error: errMsg };
+    for (const fields of fieldCandidates) {
+      const subUrl = new URL(`https://graph.facebook.com/${ver}/${params.pageId}/subscribed_apps`);
+      subUrl.searchParams.set("subscribed_fields", fields);
+      subUrl.searchParams.set("access_token", params.pageAccessToken);
+      const res = await fetch(subUrl.toString(), { method: "POST" });
+      const json = await res.json();
+      if (res.ok && json.success) {
+        await admin.from("facebook_pages").update({ webhook_subscribed: true }).eq("business_id", params.businessId).eq("page_id", params.pageId);
+        return { ok: true, subscribedFields: fields };
+      }
+      lastErr = json.error?.message || `HTTP ${res.status}`;
     }
-    return { ok: true };
+    await admin.from("facebook_pages").update({ webhook_subscribed: false }).eq("business_id", params.businessId).eq("page_id", params.pageId);
+    await admin.from("social_connection_logs").insert({
+      business_id: params.businessId,
+      platform: "facebook",
+      event_type: "webhook_subscribe",
+      status: "warning",
+      message: `Webhook subscription note for Page ${params.pageId}: ${lastErr}`
+    });
+    return { ok: false, error: lastErr };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     await admin.from("social_connection_logs").insert({
@@ -3122,6 +3184,29 @@ function sanitizeSafeHttpUrl(raw) {
   }
   return "";
 }
+async function sendMetaSenderAction(params) {
+  try {
+    const [{ token }, metaCfg] = await Promise.all([
+      resolveMetaChannelToken({
+        businessId: params.businessId,
+        channel: params.channel,
+        channelAccountId: params.channelAccountId
+      }),
+      getPlatformMetaConfig()
+    ]);
+    if (!token) return;
+    const endpoint = `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`;
+    await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: params.recipientId },
+        sender_action: params.action
+      })
+    });
+  } catch {
+  }
+}
 async function dispatchChannelReply(params) {
   if (params.channel === "web_test") {
     return { delivered: true };
@@ -3364,43 +3449,74 @@ async function syncMetaConversationsForBusiness(businessId, options) {
           if (senderType === "customer") {
             addedNewCustomerMsg = true;
             newestUnansweredText = text || (hasImg ? "Customer sent an image." : "Customer sent an attachment.");
+            await admin.from("social_webhook_events").upsert(
+              {
+                business_id: businessId,
+                platform: params.channel,
+                event_id: `${params.channel}_${m.id}`,
+                payload: { synced: true, messageId: m.id }
+              },
+              { onConflict: "event_id", ignoreDuplicates: true }
+            );
           } else {
             addedNewCustomerMsg = false;
             newestUnansweredText = "";
           }
         }
       }
-      if (latestText) {
+      if (latestText && new Date(latestAt).getTime() >= new Date(conv.last_message_at || 0).getTime()) {
         await admin.from("conversations").update({ last_message: latestText, last_message_at: latestAt }).eq("id", conv.id);
       }
-      if (options?.triggerAutoReply && addedNewCustomerMsg && newestUnansweredText && latestAt && Date.now() - new Date(latestAt).getTime() < 20 * 60 * 1e3) {
-        const aiOut = await processCustomerMessageWithAi({
-          businessId,
-          conversationId: conv.id,
-          customerMessage: newestUnansweredText
-        });
-        if (aiOut.replied && aiOut.replyText) {
-          const sent = await dispatchChannelReply({
+      if (options?.triggerAutoReply && conv.ai_enabled !== false) {
+        const { data: latestDbMsgs } = await admin.from("messages").select("id, sender_type, content, message_type, created_at").eq("conversation_id", conv.id).order("created_at", { ascending: false }).limit(2);
+        const latestDbMsg = latestDbMsgs?.[0];
+        const msgAgeMs = latestDbMsg ? Date.now() - new Date(latestDbMsg.created_at).getTime() : Infinity;
+        const isLatestUnansweredCustomer = latestDbMsg && latestDbMsg.sender_type === "customer" && msgAgeMs < 30 * 60 * 1e3 && (addedNewCustomerMsg || msgAgeMs >= 6e3);
+        const replyPromptText = isLatestUnansweredCustomer ? (latestDbMsg.content || "").trim() || (latestDbMsg.message_type === "image" ? "Customer sent an image." : "Customer sent an attachment.") : addedNewCustomerMsg && latestAt && Date.now() - new Date(latestAt).getTime() < 30 * 60 * 1e3 ? newestUnansweredText : "";
+        if (isLatestUnansweredCustomer && replyPromptText) {
+          const aiOut = await processCustomerMessageWithAi({
             businessId,
-            channel: params.channel,
-            channelAccountId: params.channelAccountId,
-            recipientId: customerId,
-            text: aiOut.replyText
+            conversationId: conv.id,
+            customerMessage: replyPromptText
           });
-          if (aiOut.messageId) {
-            if (sent.delivered && sent.externalMessageId) {
-              await admin.from("messages").update({ external_message_id: sent.externalMessageId }).eq("id", aiOut.messageId);
-            } else if (!sent.delivered) {
-              await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOut.messageId);
+          if (aiOut.replied && aiOut.replyText) {
+            const sent = await dispatchChannelReply({
+              businessId,
+              channel: params.channel,
+              channelAccountId: params.channelAccountId,
+              recipientId: customerId,
+              text: aiOut.replyText
+            });
+            if (aiOut.messageId) {
+              if (sent.delivered && sent.externalMessageId) {
+                await admin.from("messages").update({ external_message_id: sent.externalMessageId }).eq("id", aiOut.messageId);
+              } else if (!sent.delivered) {
+                await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOut.messageId);
+                broadcastToBusiness(businessId, "message:status", {
+                  conversationId: conv.id,
+                  messageId: aiOut.messageId,
+                  status: "failed"
+                });
+              }
             }
+            if (sent.delivered) {
+              aiRepliesSent += 1;
+            } else if (sent.error) {
+              const warnText = `AI reply send failed (${params.channel}): ${sent.error}`;
+              warnings.push(warnText);
+              broadcastToBusiness(businessId, "ai:warning", {
+                conversationId: conv.id,
+                message: warnText
+              });
+            }
+          } else if (aiOut.error) {
+            const warnText = `AI auto-reply skipped: ${aiOut.error}`;
+            warnings.push(warnText);
+            broadcastToBusiness(businessId, "ai:warning", {
+              conversationId: conv.id,
+              message: aiOut.error
+            });
           }
-          if (sent.delivered) {
-            aiRepliesSent += 1;
-          } else if (sent.error) {
-            warnings.push(`AI reply send failed (${params.channel}): ${sent.error}`);
-          }
-        } else if (aiOut.error) {
-          warnings.push(`AI auto-reply skipped: ${aiOut.error}`);
         }
       }
     }
@@ -3434,6 +3550,73 @@ async function syncMetaConversationsForBusiness(businessId, options) {
     aiRepliesSent,
     webhookSubscribedPages,
     warnings
+  };
+}
+async function getInstantAutoReplyDiagnostics(businessId, webhookUrl) {
+  const admin = getSupabaseAdmin();
+  const metaCfg = await getPlatformMetaConfig();
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1e3).toISOString();
+  const [
+    { data: fbPages },
+    { data: igAccounts },
+    { data: waAccounts },
+    { data: aiSettings },
+    { data: wallet },
+    { data: activeModels },
+    { data: recentEvents }
+  ] = await Promise.all([
+    admin.from("facebook_pages").select("page_id, page_name, webhook_subscribed, is_active").eq("business_id", businessId).eq("is_active", true),
+    admin.from("instagram_accounts").select("ig_account_id, username, linked_page_id, is_active").eq("business_id", businessId).eq("is_active", true),
+    admin.from("whatsapp_accounts").select("phone_number_id, display_phone_number, webhook_configured, is_active").eq("business_id", businessId).eq("is_active", true),
+    admin.from("ai_settings").select("auto_reply_enabled, is_available").eq("business_id", businessId).maybeSingle(),
+    admin.from("coin_wallets").select("balance").eq("business_id", businessId).maybeSingle(),
+    admin.from("ai_models").select("model_id, provider:ai_providers!inner(slug, provider_type, api_key_encrypted, is_active)").eq("is_active", true).eq("provider.is_active", true),
+    admin.from("social_webhook_events").select("created_at").eq("business_id", businessId).gte("created_at", since24h).order("created_at", { ascending: false }).limit(25)
+  ]);
+  const hasValidAiKey = (activeModels || []).some((m) => {
+    const prov = m.provider;
+    const dec = decryptSecret(prov?.api_key_encrypted || "");
+    if (dec) return true;
+    return prov?.provider_type === "gemini" && Boolean(process.env.GEMINI_API_KEY);
+  });
+  const coinBalance = Number(wallet?.balance || 0);
+  const autoReplyEnabled = aiSettings ? aiSettings.auto_reply_enabled !== false && aiSettings.is_available !== false : true;
+  const connectedPages = fbPages || [];
+  const connectedIg = igAccounts || [];
+  const connectedWa = waAccounts || [];
+  const subscribedPages = connectedPages.filter((p) => p.webhook_subscribed).length + connectedWa.filter((w) => w.webhook_configured).length;
+  const totalAccounts = connectedPages.length + connectedIg.length + connectedWa.length;
+  const issues = [];
+  if (!metaCfg.appId || !metaCfg.appSecret) {
+    issues.push("Meta App ID \u0993 App Secret \u09B8\u09C7\u099F \u0995\u09B0\u09BE \u09A8\u09C7\u0987 (Super Admin \u2192 Platform Settings \u2192 Meta Platform API)\u0964");
+  }
+  if (totalAccounts === 0) {
+    issues.push("\u0995\u09CB\u09A8\u09CB Facebook Page, Instagram \u09AC\u09BE WhatsApp \u0985\u09CD\u09AF\u09BE\u0995\u09BE\u0989\u09A8\u09CD\u099F \u0995\u09BE\u09A8\u09C7\u0995\u09CD\u099F \u0995\u09B0\u09BE \u09A8\u09C7\u0987\u0964");
+  } else if (connectedPages.some((p) => !p.webhook_subscribed) || connectedWa.some((w) => !w.webhook_configured)) {
+    issues.push('\u09AA\u09C7\u099C\u09C7\u09B0 Meta Webhook \u09B8\u09BE\u09AC\u09B8\u09CD\u0995\u09CD\u09B0\u09BF\u09AA\u09B6\u09A8 \u09AC\u09BE\u0995\u09BF \u0986\u099B\u09C7 \u2014 "Enable Instant Webhook" \u099A\u09BE\u09AA\u09C1\u09A8\u0964');
+  }
+  if (!hasValidAiKey) {
+    issues.push("\u0995\u09CB\u09A8\u09CB \u09B8\u0995\u09CD\u09B0\u09BF\u09DF AI Provider API Key \u09B8\u09C7\u099F \u0995\u09B0\u09BE \u09A8\u09C7\u0987\u0964");
+  }
+  if (!autoReplyEnabled) {
+    issues.push("AI Studio Settings-\u098F Auto-Reply \u09AC\u09A8\u09CD\u09A7 \u0986\u099B\u09C7\u0964");
+  }
+  if (coinBalance <= 0) {
+    issues.push("AI Coin \u09AC\u09CD\u09AF\u09BE\u09B2\u09C7\u09A8\u09CD\u09B8 \u09E6 \u2014 \u0985\u099F\u09CB-\u09B0\u09BF\u09AA\u09CD\u09B2\u09BE\u0987\u09DF\u09C7\u09B0 \u099C\u09A8\u09CD\u09AF \u0995\u09DF\u09C7\u09A8 \u09B0\u09BF\u099A\u09BE\u09B0\u09CD\u099C \u0995\u09B0\u09C1\u09A8\u0964");
+  }
+  return {
+    ready: issues.length === 0,
+    metaConfigured: Boolean(metaCfg.appId && metaCfg.appSecret),
+    webhookUrl,
+    webhookVerifyToken: metaCfg.webhookVerifyToken,
+    totalAccounts,
+    subscribedPages,
+    hasValidAiKey,
+    autoReplyEnabled,
+    coinBalance,
+    webhookEvents24h: (recentEvents || []).length,
+    lastWebhookAt: recentEvents?.[0]?.created_at || null,
+    issues
   };
 }
 
@@ -4270,7 +4453,28 @@ router3.get("/businesses/:businessId/conversations/:conversationId/messages", re
       admin.from("conversations").update({ unread_count: 0 }).eq("id", req.params.conversationId).eq("business_id", req.businessId),
       admin.from("messages").update({ delivery_status: "read" }).eq("conversation_id", req.params.conversationId).eq("business_id", req.businessId).eq("sender_type", "customer").neq("delivery_status", "read")
     ]);
-    return res.json({ messages: data || [] });
+    let latestAiWarning = "";
+    const msgs = data || [];
+    const latestMsg = msgs[msgs.length - 1];
+    if (latestMsg?.sender_type === "customer") {
+      const [{ data: convRow }, { data: aiSettings }, { data: recentUsageErr }, { data: recentConnErr }] = await Promise.all([
+        admin.from("conversations").select("ai_enabled").eq("id", req.params.conversationId).eq("business_id", req.businessId).maybeSingle(),
+        admin.from("ai_settings").select("auto_reply_enabled").eq("business_id", req.businessId).maybeSingle(),
+        admin.from("ai_usage_logs").select("status, error_message, created_at").eq("business_id", req.businessId).eq("conversation_id", req.params.conversationId).in("status", ["error", "blocked_insufficient_coins"]).order("created_at", { ascending: false }).limit(1).maybeSingle(),
+        admin.from("social_connection_logs").select("message, created_at").eq("business_id", req.businessId).eq("status", "error").in("event_type", ["ai_reply_skipped", "reply_dispatch_failed"]).order("created_at", { ascending: false }).limit(1).maybeSingle()
+      ]);
+      const msgTime = latestMsg.created_at ? new Date(latestMsg.created_at).getTime() - 1e4 : 0;
+      if (convRow && convRow.ai_enabled === false) {
+        latestAiWarning = '\u098F\u0987 \u099A\u09CD\u09AF\u09BE\u099F\u09C7 AI \u0985\u099F\u09CB-\u09B0\u09BF\u09AA\u09CD\u09B2\u09BE\u0987 \u09AC\u09A8\u09CD\u09A7 (Manual Mode) \u0986\u099B\u09C7\u0964 \u0989\u09AA\u09B0\u09C7 "AI \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09C1\u09A8" \u099A\u09BE\u09AA\u09C1\u09A8 \u0985\u09A5\u09AC\u09BE \u09AE\u09CD\u09AF\u09BE\u09A8\u09C1\u09DF\u09BE\u09B2\u09BF \u0989\u09A4\u09CD\u09A4\u09B0 \u09A6\u09BF\u09A8\u0964';
+      } else if (aiSettings && aiSettings.auto_reply_enabled === false) {
+        latestAiWarning = "AI Settings-\u098F \u0997\u09CD\u09B2\u09CB\u09AC\u09BE\u09B2 Auto-Reply \u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09BE \u0986\u099B\u09C7\u0964";
+      } else if (recentUsageErr?.error_message && new Date(recentUsageErr.created_at).getTime() >= msgTime) {
+        latestAiWarning = recentUsageErr.error_message;
+      } else if (recentConnErr?.message && new Date(recentConnErr.created_at).getTime() >= msgTime) {
+        latestAiWarning = recentConnErr.message;
+      }
+    }
+    return res.json({ messages: msgs, latestAiWarning });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load messages." });
   }
@@ -5098,6 +5302,77 @@ router4.post("/businesses/:businessId/social/sync-inbox", requireAuth, requireBu
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to sync Meta inbox." });
   }
 });
+router4.get("/businesses/:businessId/social/webhook-status", requireAuth, requireBusinessAccess("inbox"), async (req, res) => {
+  try {
+    const webhookUrl = `${resolveAppBaseUrl(req)}/api/webhooks/meta`;
+    const diagnostics = await getInstantAutoReplyDiagnostics(req.businessId, webhookUrl);
+    return res.json(diagnostics);
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to inspect webhook status." });
+  }
+});
+router4.post("/businesses/:businessId/social/webhook-subscribe", requireAuth, requireBusinessAccess("settings"), async (req, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    const businessId = req.businessId;
+    const metaCfg = await getPlatformMetaConfig();
+    const [{ data: fbPages }, { data: igAccounts }, { data: waAccounts }] = await Promise.all([
+      admin.from("facebook_pages").select("page_id, page_name, page_access_token_encrypted").eq("business_id", businessId).eq("is_active", true),
+      admin.from("instagram_accounts").select("linked_page_id, username, access_token_encrypted").eq("business_id", businessId).eq("is_active", true),
+      admin.from("whatsapp_accounts").select("waba_id, access_token_encrypted").eq("business_id", businessId).eq("is_active", true)
+    ]);
+    const subscribedPages = [];
+    const failedPages = [];
+    const donePageIds = /* @__PURE__ */ new Set();
+    for (const p of fbPages || []) {
+      if (donePageIds.has(p.page_id)) continue;
+      donePageIds.add(p.page_id);
+      const token = decryptSecret(p.page_access_token_encrypted || "");
+      if (!token) continue;
+      const r = await subscribePageToMetaWebhooks({
+        businessId,
+        pageId: p.page_id,
+        pageAccessToken: token,
+        apiVersion: metaCfg.apiVersion
+      });
+      if (r.ok) subscribedPages.push(p.page_name || p.page_id);
+      else failedPages.push({ name: p.page_name || p.page_id, error: r.error || "Subscription failed" });
+    }
+    for (const ig of igAccounts || []) {
+      if (!ig.linked_page_id || donePageIds.has(ig.linked_page_id)) continue;
+      donePageIds.add(ig.linked_page_id);
+      const token = decryptSecret(ig.access_token_encrypted || "");
+      if (!token) continue;
+      const r = await subscribePageToMetaWebhooks({
+        businessId,
+        pageId: ig.linked_page_id,
+        pageAccessToken: token,
+        apiVersion: metaCfg.apiVersion
+      });
+      if (r.ok) subscribedPages.push(ig.username || ig.linked_page_id);
+      else failedPages.push({ name: ig.username || ig.linked_page_id, error: r.error || "Subscription failed" });
+    }
+    const doneWabas = /* @__PURE__ */ new Set();
+    for (const wa of waAccounts || []) {
+      if (!wa.waba_id || doneWabas.has(wa.waba_id)) continue;
+      doneWabas.add(wa.waba_id);
+      const token = decryptSecret(wa.access_token_encrypted || "");
+      if (!token) continue;
+      const r = await subscribeWabaToMetaWebhooks({
+        businessId,
+        wabaId: wa.waba_id,
+        accessToken: token,
+        apiVersion: metaCfg.apiVersion
+      });
+      if (r.ok) subscribedPages.push(`WhatsApp (${wa.waba_id})`);
+      else failedPages.push({ name: `WhatsApp (${wa.waba_id})`, error: r.error || "Subscription failed" });
+    }
+    const diagnostics = await getInstantAutoReplyDiagnostics(businessId, `${resolveAppBaseUrl(req)}/api/webhooks/meta`);
+    return res.json({ subscribedPages, failedPages, diagnostics });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to subscribe webhooks." });
+  }
+});
 router4.get("/businesses/:businessId/social/oauth/:platform/url", requireAuth, requireBusinessAccess("settings"), async (req, res) => {
   try {
     const platform = req.params.platform;
@@ -5183,12 +5458,12 @@ router4.get(["/oauth/meta/callback", "/oauth/meta/callback/"], async (req, res) 
 });
 router4.get("/webhooks/meta", async (req, res) => {
   try {
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
+    const mode = String(req.query["hub.mode"] || "").trim();
+    const token = String(req.query["hub.verify_token"] || "").trim();
+    const challenge = String(req.query["hub.challenge"] || "");
     const metaCfg = await getPlatformMetaConfig();
-    if (mode === "subscribe" && token === metaCfg.webhookVerifyToken) {
-      return res.status(200).send(challenge);
+    if (mode === "subscribe" && token && token === metaCfg.webhookVerifyToken.trim()) {
+      return res.status(200).type("text/plain").send(challenge);
     }
     return res.status(403).send("Forbidden");
   } catch (err) {
@@ -5210,9 +5485,20 @@ router4.post("/webhooks/meta", async (req, res) => {
     const payload = req.body;
     const admin = getSupabaseAdmin();
     for (const entry of payload.entry || []) {
-      if (entry.messaging) {
+      const igChangeMessaging = payload.object === "instagram" && entry.changes ? entry.changes.filter((c) => c.field === "messages" && c.value?.sender?.id && c.value?.message).map((c) => ({
+        sender: c.value.sender,
+        recipient: c.value.recipient || { id: entry.id },
+        timestamp: Number(c.value.timestamp || Date.now()),
+        message: c.value.message
+      })) : [];
+      const messagingList = [
+        ...entry.messaging || [],
+        ...entry.standby || [],
+        ...igChangeMessaging
+      ];
+      if (messagingList.length > 0) {
         const channel = payload.object === "instagram" ? "instagram" : "facebook";
-        for (const msgEvent of entry.messaging) {
+        for (const msgEvent of messagingList) {
           if (msgEvent.delivery || msgEvent.read) {
             const senderId2 = msgEvent.sender?.id;
             const recipientId2 = msgEvent.recipient?.id;
@@ -5237,7 +5523,8 @@ router4.post("/webhooks/meta", async (req, res) => {
             continue;
           }
           if (msgEvent.message?.is_echo) continue;
-          const incomingAtts = (msgEvent.message?.attachments || []).map((a) => {
+          const rawAttachments = msgEvent.message?.attachments || [];
+          const incomingAtts = rawAttachments.map((a) => {
             const rawUrl = a.payload?.url || "";
             if (!rawUrl.startsWith("https://") && !rawUrl.startsWith("http://")) return null;
             const isImg = a.type === "image";
@@ -5249,8 +5536,11 @@ router4.post("/webhooks/meta", async (req, res) => {
             };
           }).filter((v) => Boolean(v));
           const hasImageAtt = incomingAtts.some((a) => a.file_type === "image");
+          const firstNonUrlAttType = rawAttachments.find((a) => !a.payload?.url)?.type;
+          const hasSticker = rawAttachments.some((a) => Boolean(a.payload?.sticker_id));
+          const fallbackAttSummary = hasImageAtt ? "\u{1F4F7} Photo" : incomingAtts.length > 0 ? "\u{1F4CE} Attachment" : hasSticker ? "\u{1F44D} Sticker" : firstNonUrlAttType ? `[${firstNonUrlAttType}]` : "";
           const rawText = msgEvent.message?.text?.trim() || msgEvent.postback?.title?.trim() || "";
-          const previewSummary = rawText || (hasImageAtt ? "\u{1F4F7} Photo" : incomingAtts.length > 0 ? "\u{1F4CE} Attachment" : "");
+          const previewSummary = rawText || fallbackAttSummary;
           const mid = msgEvent.message?.mid || msgEvent.postback?.mid || `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const senderId = msgEvent.sender?.id;
           const recipientId = msgEvent.recipient?.id;
@@ -5284,6 +5574,8 @@ router4.post("/webhooks/meta", async (req, res) => {
             payload: msgEvent
           });
           if (dupErr) continue;
+          const { data: existingExternalMsg } = await admin.from("messages").select("id").eq("business_id", matchedBusinessId).eq("external_message_id", mid).limit(1).maybeSingle();
+          if (existingExternalMsg) continue;
           try {
             let { data: conv } = await admin.from("conversations").select("*").eq("business_id", matchedBusinessId).eq("channel", channel).eq("external_thread_id", senderId).maybeSingle();
             let senderName = `${channel.toUpperCase()} User ${senderId.slice(-4)}`;
@@ -5350,7 +5642,34 @@ router4.post("/webhooks/meta", async (req, res) => {
                 const { data: fullMsg } = await admin.from("messages").select("*, attachments:message_attachments(*)").eq("id", savedMsg.id).single();
                 broadcastToBusiness(matchedBusinessId, "message:new", fullMsg || savedMsg);
               }
-              const aiInputText = rawText || (hasImageAtt ? "Customer sent an image." : "Customer sent a file attachment.");
+              void sendMetaSenderAction({
+                businessId: matchedBusinessId,
+                channel,
+                channelAccountId: matchedAccountId,
+                recipientId: senderId,
+                action: "mark_seen"
+              });
+              void sendMetaSenderAction({
+                businessId: matchedBusinessId,
+                channel,
+                channelAccountId: matchedAccountId,
+                recipientId: senderId,
+                action: "typing_on"
+              });
+              if (!rawText && savedMsg) {
+                await new Promise((r) => setTimeout(r, 900));
+                const { data: newerCheck } = await admin.from("messages").select("id").eq("conversation_id", conv.id).gt("created_at", savedMsg.created_at).limit(1).maybeSingle();
+                if (newerCheck) {
+                  continue;
+                }
+              }
+              if (savedMsg) {
+                const { data: alreadyReplied } = await admin.from("messages").select("id").eq("conversation_id", conv.id).eq("sender_type", "ai").gte("created_at", savedMsg.created_at).limit(1).maybeSingle();
+                if (alreadyReplied) {
+                  continue;
+                }
+              }
+              const aiInputText = rawText || (hasSticker ? "Customer sent a thumbs-up / sticker reaction." : hasImageAtt ? "Customer sent an image." : `Customer sent ${fallbackAttSummary || "an attachment"}.`);
               const aiOut = await processCustomerMessageWithAi({
                 businessId: matchedBusinessId,
                 conversationId: conv.id,
@@ -5377,22 +5696,40 @@ router4.post("/webhooks/meta", async (req, res) => {
                   }
                 }
                 if (!dispatch.delivered) {
+                  const warnMsg = dispatch.error || "Failed to deliver AI reply to Meta.";
                   await admin.from("social_connection_logs").insert({
                     business_id: matchedBusinessId,
                     platform: channel,
                     event_type: "reply_dispatch_failed",
                     status: "error",
-                    message: dispatch.error || "Failed to deliver AI reply to Meta."
+                    message: warnMsg
+                  });
+                  broadcastToBusiness(matchedBusinessId, "ai:warning", {
+                    conversationId: conv.id,
+                    message: warnMsg
                   });
                 }
-              } else if (aiOut.error) {
-                await admin.from("social_connection_logs").insert({
-                  business_id: matchedBusinessId,
-                  platform: channel,
-                  event_type: "ai_reply_skipped",
-                  status: "error",
-                  message: aiOut.error
+              } else {
+                void sendMetaSenderAction({
+                  businessId: matchedBusinessId,
+                  channel,
+                  channelAccountId: matchedAccountId,
+                  recipientId: senderId,
+                  action: "typing_off"
                 });
+                if (aiOut.error) {
+                  await admin.from("social_connection_logs").insert({
+                    business_id: matchedBusinessId,
+                    platform: channel,
+                    event_type: "ai_reply_skipped",
+                    status: "error",
+                    message: aiOut.error
+                  });
+                  broadcastToBusiness(matchedBusinessId, "ai:warning", {
+                    conversationId: conv.id,
+                    message: aiOut.error
+                  });
+                }
               }
             }
           } catch (msgErr) {
@@ -5433,6 +5770,8 @@ router4.post("/webhooks/meta", async (req, res) => {
               payload: waMsg
             });
             if (dupErr) continue;
+            const { data: existingWaMsg } = await admin.from("messages").select("id").eq("business_id", waAcc.business_id).eq("external_message_id", mid).limit(1).maybeSingle();
+            if (existingWaMsg) continue;
             try {
               const contactName = val.contacts?.[0]?.profile?.name || `WhatsApp ${from.slice(-4)}`;
               let { data: conv } = await admin.from("conversations").select("*").eq("business_id", waAcc.business_id).eq("channel", "whatsapp").eq("external_thread_id", from).maybeSingle();
@@ -5495,12 +5834,17 @@ router4.post("/webhooks/meta", async (req, res) => {
                     }
                   }
                   if (!dispatch.delivered) {
+                    const warnMsg = dispatch.error || "Failed to deliver WhatsApp AI reply.";
                     await admin.from("social_connection_logs").insert({
                       business_id: waAcc.business_id,
                       platform: "whatsapp",
                       event_type: "reply_dispatch_failed",
                       status: "error",
-                      message: dispatch.error || "Failed to deliver WhatsApp AI reply."
+                      message: warnMsg
+                    });
+                    broadcastToBusiness(waAcc.business_id, "ai:warning", {
+                      conversationId: conv.id,
+                      message: warnMsg
                     });
                   }
                 } else if (aiOut.error) {
@@ -5509,6 +5853,10 @@ router4.post("/webhooks/meta", async (req, res) => {
                     platform: "whatsapp",
                     event_type: "ai_reply_skipped",
                     status: "error",
+                    message: aiOut.error
+                  });
+                  broadcastToBusiness(waAcc.business_id, "ai:warning", {
+                    conversationId: conv.id,
                     message: aiOut.error
                   });
                 }

@@ -125,6 +125,19 @@ export async function processCustomerMessageWithAi(params: {
   ]);
 
   const orderedHistory = (history || []).reverse();
+  const trailingCustomerMsgs: string[] = [];
+  for (let i = orderedHistory.length - 1; i >= 0; i--) {
+    if (orderedHistory[i].sender_type === 'customer') {
+      const txt = String(orderedHistory[i].content || '').trim();
+      if (txt) trailingCustomerMsgs.unshift(txt);
+    } else {
+      break;
+    }
+  }
+  const combinedLatestCustomerMsg =
+    trailingCustomerMsgs.length > 1
+      ? trailingCustomerMsgs.join('\n')
+      : params.customerMessage;
   const defaultDelivery = Number(aiSettings?.order_collection_rules?.default_delivery_charge ?? 60);
 
   const systemInstruction = `You are "${aiSettings?.agent_name || 'BeXpar Assistant'}", the official AI Customer Service & Sales Agent for "${business?.name || 'our store'}" (${business?.category || ''}) on channel: ${conv.channel}.
@@ -141,6 +154,12 @@ STRICT ACCURACY & GROUNDING RULES (NEVER VIOLATE):
 4. For orders: collect missing required fields (Customer Name, Phone Number, Full Delivery Address, Product, Quantity, Color/Size if product has variants). Ask ONLY for missing information.
 5. Set "extracted_order.ready_to_create": true ONLY when you have Customer Name, valid Phone Number, Full Delivery Address, and at least one matched product_id from the catalog with stock > 0, and the customer has confirmed or clearly placed the order.
 6. Standard default delivery charge (unless specified in Knowledge Base): ${defaultDelivery} BDT.
+
+STORE CONTACT & LOCATION:
+- Store Name: ${business?.name || 'Our Store'}
+- Category: ${business?.category || 'General'}
+- Phone: ${business?.phone || 'Not provided'}
+- Address / Location: ${business?.address || 'Not provided'}
 
 CUSTOM BUSINESS INSTRUCTIONS:
 ${aiSettings?.system_instructions || 'Be helpful, polite, and accurate.'}
@@ -168,7 +187,7 @@ RETURN STRICT JSON ONLY matching this schema:
 
   const prompt = `CONVERSATION HISTORY:\n${orderedHistory
     .map((m) => `[${m.sender_type.toUpperCase()}]: ${m.content}`)
-    .join('\n')}\n\nLATEST CUSTOMER MESSAGE:\n${params.customerMessage}`;
+    .join('\n')}\n\nLATEST CUSTOMER MESSAGE:\n${combinedLatestCustomerMsg}`;
 
   let genResult;
   try {
@@ -278,17 +297,28 @@ RETURN STRICT JSON ONLY matching this schema:
     .select('*')
     .single();
 
-  await admin
+  const shouldPauseAi = Boolean(
+    parsed.should_handover &&
+      parsed.intent === 'human_handover' &&
+      aiSettings?.human_handover_enabled
+  );
+
+  const { data: updatedConv } = await admin
     .from('conversations')
     .update({
       last_message: parsed.reply_text,
       last_message_at: new Date().toISOString(),
-      ...(parsed.should_handover && aiSettings?.human_handover_enabled ? { ai_enabled: false } : {}),
+      ...(shouldPauseAi ? { ai_enabled: false } : {}),
     })
-    .eq('id', params.conversationId);
+    .eq('id', params.conversationId)
+    .select('*, customer:customers(*)')
+    .single();
 
   if (savedAiMsg) {
     broadcastToBusiness(params.businessId, 'message:new', savedAiMsg);
+  }
+  if (updatedConv) {
+    broadcastToBusiness(params.businessId, 'conversation:updated', updatedConv);
   }
 
   // 7. Automatic Order Creation if ready_to_create & valid

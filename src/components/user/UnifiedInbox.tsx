@@ -240,6 +240,9 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
   const [syncing, setSyncing] = useState(false);
   const [syncNotice, setSyncNotice] = useState('');
   const [error, setError] = useState('');
+  const [aiWarning, setAiWarning] = useState('');
+  const [webhookIssues, setWebhookIssues] = useState<string[]>([]);
+  const [subscribingWebhook, setSubscribingWebhook] = useState(false);
 
   // Messenger UX states
   const [pendingAttachment, setPendingAttachment] = useState<PendingAttachment | null>(null);
@@ -265,6 +268,7 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
   const conversationsRef = useRef<Conversation[]>([]);
   const soundEnabledRef = useRef<boolean>(true);
   const prevUnreadTotalRef = useRef<number | null>(null);
+  const syncInFlightRef = useRef<boolean>(false);
 
   useEffect(() => {
     conversationsRef.current = conversations;
@@ -278,6 +282,7 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
     selectedIdRef.current = selected?.id || null;
     setNotesDraft(selected?.internal_notes || '');
     setEmojiOpen(false);
+    setAiWarning('');
   }, [selected?.id, selected?.internal_notes]);
 
   // Revoke object URL on unmount or attachment change
@@ -345,11 +350,12 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
   const loadMessages = useCallback(async (convId: string, opts?: { silent?: boolean }) => {
     if (!opts?.silent) setLoadingMessages(true);
     try {
-      const res = await apiFetch<{ messages: Message[] }>(
+      const res = await apiFetch<{ messages: Message[]; latestAiWarning?: string }>(
         `/api/businesses/${business.id}/conversations/${convId}/messages`,
         { businessId: business.id }
       );
       setMessages(res.messages || []);
+      setAiWarning(res.latestAiWarning || '');
       setConversations((prev) =>
         prev.map((c) => (c.id === convId ? { ...c, unread_count: 0 } : c))
       );
@@ -363,7 +369,9 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
     }
   }, [business.id]);
 
-  const syncMetaInbox = async (opts?: { triggerAutoReply?: boolean; silent?: boolean }) => {
+  const syncMetaInbox = useCallback(async (opts?: { triggerAutoReply?: boolean; silent?: boolean }) => {
+    if (syncInFlightRef.current) return;
+    syncInFlightRef.current = true;
     if (!opts?.silent) {
       setError('');
       setSyncNotice('');
@@ -388,7 +396,9 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
       }
 
       if (res.warnings?.length) {
-        setError(res.warnings[0]);
+        if (!opts?.silent) {
+          setError(res.warnings[0]);
+        }
       } else if (!opts?.silent) {
         if (res.syncedMessages > 0 || res.aiRepliesSent > 0) {
           setSyncNotice(
@@ -409,17 +419,61 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
         setError(err instanceof Error ? err.message : 'Failed to sync Meta conversations.');
       }
     } finally {
+      syncInFlightRef.current = false;
       setSyncing(false);
+    }
+  }, [business.id, lang, loadConversations, loadMessages]);
+
+  const loadWebhookStatus = useCallback(async () => {
+    try {
+      const diag = await apiFetch<{ issues?: string[] }>(
+        `/api/businesses/${business.id}/social/webhook-status`,
+        { businessId: business.id }
+      );
+      setWebhookIssues(diag.issues || []);
+    } catch {
+      // Ignore diagnostic probe errors
+    }
+  }, [business.id]);
+
+  const handleEnableInstantWebhook = async () => {
+    setSubscribingWebhook(true);
+    setError('');
+    try {
+      const res = await apiFetch<{
+        subscribedPages: string[];
+        failedPages: Array<{ name: string; error: string }>;
+        diagnostics?: { issues?: string[] };
+      }>(`/api/businesses/${business.id}/social/webhook-subscribe`, {
+        method: 'POST',
+        businessId: business.id,
+      });
+      setWebhookIssues(res.diagnostics?.issues || []);
+      if (res.failedPages?.length) {
+        setError(`${res.failedPages[0].name}: ${res.failedPages[0].error}`);
+      } else {
+        setSyncNotice(
+          lang === 'bn'
+            ? `Instant Auto-Reply Webhook সক্রিয় হয়েছে (${res.subscribedPages.length}টি চ্যানেল)।`
+            : `Instant Auto-Reply webhook active for ${res.subscribedPages.length} channel(s).`
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to enable webhook.');
+    } finally {
+      setSubscribingWebhook(false);
     }
   };
 
   useEffect(() => {
     setSelected(null);
     setMessages([]);
+    setAiWarning('');
     prevUnreadTotalRef.current = null;
     void loadConversations();
+    void loadWebhookStatus();
     void syncMetaInbox({ triggerAutoReply: true, silent: true });
-  }, [business.id]);
+  }, [business.id, loadConversations, loadWebhookStatus, syncMetaInbox]);
 
   useEffect(() => {
     if (selected?.id) {
@@ -459,6 +513,9 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
                   const exists = prev.some((m) => m.id === incoming.id);
                   return exists ? prev : [...prev, incoming];
                 });
+                if (incoming.sender_type !== 'customer') {
+                  setAiWarning('');
+                }
                 setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 60);
                 if (incoming.sender_type === 'customer') {
                   void apiFetch(`/api/businesses/${business.id}/conversations/${incoming.conversation_id}/read`, {
@@ -478,6 +535,11 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
                 });
               }
               void loadConversations();
+            } else if (parsed.event === 'ai:warning') {
+              const warn = parsed.payload as { conversationId?: string; message?: string };
+              if (warn.conversationId && warn.conversationId === selectedIdRef.current && warn.message) {
+                setAiWarning(warn.message);
+              }
             } else if (parsed.event === 'conversation:updated') {
               void loadConversations({ notifyOnNewUnread: true });
             } else if (parsed.event === 'message:status') {
@@ -524,12 +586,18 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
       }
     }, 5000);
 
+    const syncTimer = window.setInterval(() => {
+      if (!active || wsOpen || document.visibilityState !== 'visible') return;
+      void syncMetaInbox({ triggerAutoReply: true, silent: true });
+    }, 8000);
+
     return () => {
       active = false;
       window.clearInterval(pollTimer);
+      window.clearInterval(syncTimer);
       ws?.close();
     };
-  }, [business.id, loadConversations, loadMessages]);
+  }, [business.id, loadConversations, loadMessages, syncMetaInbox]);
 
   const handleSelectFile = (file: File, forcedType?: 'image' | 'file') => {
     setError('');
@@ -887,6 +955,30 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
             </button>
           </div>
         </form>
+      )}
+
+      {webhookIssues.length > 0 && (
+        <div className="mb-3 rounded-2xl border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/35 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-800 dark:text-amber-200">
+          <div className="flex items-start gap-2 min-w-0 flex-1">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+            <span>
+              <strong>{lang === 'bn' ? 'Instant Auto-Reply সতর্কতা: ' : 'Instant Auto-Reply Check: '}</strong>
+              {webhookIssues[0]}
+            </span>
+          </div>
+          {webhookIssues[0].includes('Webhook') && (
+            <button
+              type="button"
+              disabled={subscribingWebhook}
+              onClick={() => void handleEnableInstantWebhook()}
+              className="px-3 py-1.5 rounded-xl bg-[#5B35F5] text-white font-semibold hover:bg-[#4924DE] disabled:opacity-60 shrink-0"
+            >
+              {subscribingWebhook
+                ? lang === 'bn' ? 'চালু হচ্ছে...' : 'Enabling...'
+                : lang === 'bn' ? 'Instant Webhook চালু করুন' : 'Enable Instant Webhook'}
+            </button>
+          )}
+        </div>
       )}
 
       {/* Main Messenger Shell */}
@@ -1307,6 +1399,35 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
                 )}
                 <div ref={messagesEndRef} />
               </div>
+
+              {/* AI Auto-Reply Diagnostic Banner */}
+              {aiWarning && (
+                <div className="px-3.5 sm:px-4 py-2 border-t border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/35 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex items-start gap-2 text-amber-800 dark:text-amber-200 min-w-0 flex-1">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                    <span className="break-words">{aiWarning}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      disabled={sending}
+                      onClick={() => void handleSendReply('ai')}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#5B35F5] text-white font-semibold hover:bg-[#4924DE] disabled:opacity-50 transition-colors"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      <span>{lang === 'bn' ? 'AI দিয়ে উত্তর দিন' : 'Retry AI Reply'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAiWarning('')}
+                      aria-label="Dismiss AI warning"
+                      className="p-1 rounded-lg text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Pending Image / File Preview Before Sending */}
               {pendingAttachment && (
