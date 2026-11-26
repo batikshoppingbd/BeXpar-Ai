@@ -1,6 +1,11 @@
 import { Router } from 'express';
 import { encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
-import { testModelConnection } from '../ai/providerRouter.ts';
+import {
+  ensureDefaultAiProvidersAndModels,
+  ensureDefaultModelForProvider,
+  testModelConnection,
+  testProviderConnection,
+} from '../ai/providerRouter.ts';
 import { checkSchemaStatus } from '../db/migrator.ts';
 import { createNotification, writeAuditLog } from '../db/repository.ts';
 import { requireAuth, requireSuperAdmin, type AuthedRequest } from '../middleware/auth.ts';
@@ -733,99 +738,198 @@ router.patch('/subscription-plans/:id', async (req: AuthedRequest, res) => {
 
 // AI Providers & Models Management
 router.get('/ai', async (_req, res) => {
-  const admin = getSupabaseAdmin();
-  const [{ data: providers }, { data: models }, { data: usageLogs }] = await Promise.all([
-    admin.from('ai_providers').select('id, slug, name, provider_type, base_url, api_key_encrypted, is_active, priority, updated_at').order('priority'),
-    admin.from('ai_models').select('*, provider:ai_providers(id, slug, name)').order('priority'),
-    admin.from('ai_usage_logs').select('*').order('created_at', { ascending: false }).limit(80),
-  ]);
+  try {
+    const admin = getSupabaseAdmin();
+    await ensureDefaultAiProvidersAndModels();
 
-  // Never send encrypted or raw API keys to the browser; only expose boolean has_api_key
-  const safeProviders = (providers || []).map((p) => ({
-    id: p.id,
-    slug: p.slug,
-    name: p.name,
-    provider_type: p.provider_type,
-    base_url: p.base_url,
-    is_active: p.is_active,
-    priority: p.priority,
-    updated_at: p.updated_at,
-    has_api_key: Boolean(p.api_key_encrypted && String(p.api_key_encrypted).trim().length > 0),
-  }));
+    const [provRes, modelRes, logRes] = await Promise.all([
+      admin
+        .from('ai_providers')
+        .select('id, slug, name, provider_type, base_url, api_key_encrypted, is_active, priority, updated_at')
+        .order('priority'),
+      admin.from('ai_models').select('*, provider:ai_providers(id, slug, name)').order('priority'),
+      admin.from('ai_usage_logs').select('*').order('created_at', { ascending: false }).limit(80),
+    ]);
 
-  return res.json({ providers: safeProviders, models: models || [], usageLogs: usageLogs || [] });
+    if (provRes.error) return res.status(500).json({ error: provRes.error.message });
+    if (modelRes.error) return res.status(500).json({ error: modelRes.error.message });
+
+    // Never send encrypted or raw API keys to the browser; only expose boolean has_api_key
+    const safeProviders = (provRes.data || []).map((p) => ({
+      id: p.id,
+      slug: p.slug,
+      name: p.name,
+      provider_type: p.provider_type,
+      base_url: p.base_url,
+      is_active: p.is_active,
+      priority: p.priority,
+      updated_at: p.updated_at,
+      has_api_key: Boolean(p.api_key_encrypted && String(p.api_key_encrypted).trim().length > 0),
+    }));
+
+    return res.json({ providers: safeProviders, models: modelRes.data || [], usageLogs: logRes.data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load AI providers.' });
+  }
 });
 
 router.post('/ai/providers', async (req: AuthedRequest, res) => {
   const admin = getSupabaseAdmin();
   const { slug, name, provider_type, base_url, api_key, is_active, priority } = req.body as Record<string, unknown>;
-  if (!isValidHttpOrRelativeUrl(base_url, false)) {
+  const cleanSlug = String(slug || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_');
+  const cleanName = String(name || '').trim();
+  const cleanBaseUrl = typeof base_url === 'string' ? base_url.trim() : '';
+  const cleanKey = typeof api_key === 'string' ? api_key.trim() : '';
+
+  if (!cleanSlug || !cleanName) {
+    return res.status(400).json({ error: 'Provider slug and display name are required.' });
+  }
+  if (!isValidHttpOrRelativeUrl(cleanBaseUrl, false)) {
     return res.status(400).json({ error: 'Invalid provider Base URL. Must be a public http(s) URL.' });
   }
+
   const { data, error } = await admin
     .from('ai_providers')
     .insert({
-      slug,
-      name,
-      provider_type,
-      base_url: base_url || '',
-      api_key_encrypted: api_key ? encryptSecret(String(api_key)) : '',
+      slug: cleanSlug,
+      name: cleanName,
+      provider_type: String(provider_type || 'custom'),
+      base_url: cleanBaseUrl,
+      api_key_encrypted: cleanKey ? encryptSecret(cleanKey) : '',
       is_active: is_active !== false,
       priority: Number(priority || 1),
     })
     .select('id, slug, name, provider_type, base_url, is_active, priority')
     .single();
   if (error) return res.status(400).json({ error: error.message });
-  await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_provider_created', targetType: 'ai_provider', targetId: data.id, details: { slug, name } });
-  return res.status(201).json({ provider: { ...data, has_api_key: Boolean(api_key) } });
+  await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_provider_created', targetType: 'ai_provider', targetId: data.id, details: { slug: cleanSlug, name: cleanName } });
+  return res.status(201).json({ provider: { ...data, has_api_key: Boolean(cleanKey) } });
 });
 
 router.patch('/ai/providers/:id', async (req: AuthedRequest, res) => {
-  const admin = getSupabaseAdmin();
-  const { name, base_url, api_key, is_active, priority } = req.body as Record<string, unknown>;
-  if (!isValidHttpOrRelativeUrl(base_url, false)) {
-    return res.status(400).json({ error: 'Invalid provider Base URL. Must be a public http(s) URL.' });
+  try {
+    const admin = getSupabaseAdmin();
+    const { name, base_url, api_key, is_active, priority } = req.body as Record<string, unknown>;
+    const cleanBaseUrl = typeof base_url === 'string' ? base_url.trim() : undefined;
+    const cleanKey = typeof api_key === 'string' ? api_key.trim() : '';
+
+    if (cleanBaseUrl !== undefined && !isValidHttpOrRelativeUrl(cleanBaseUrl, false)) {
+      return res.status(400).json({ error: 'Invalid provider Base URL. Must be a public http(s) URL.' });
+    }
+
+    const { data: existing } = await admin
+      .from('ai_providers')
+      .select('id, provider_type, name, is_active, api_key_encrypted')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (!existing) {
+      return res.status(404).json({ error: 'AI provider not found.' });
+    }
+
+    const payload: Record<string, unknown> = {
+      ...(name !== undefined ? { name: String(name).trim() } : {}),
+      ...(cleanBaseUrl !== undefined ? { base_url: cleanBaseUrl } : {}),
+      ...(is_active !== undefined ? { is_active: Boolean(is_active) } : {}),
+      ...(priority !== undefined ? { priority: Number(priority) } : {}),
+    };
+
+    if (cleanKey) {
+      payload.api_key_encrypted = encryptSecret(cleanKey);
+      if (is_active === undefined && !existing.is_active) {
+        payload.is_active = true;
+      }
+    }
+
+    if (Object.keys(payload).length === 0) {
+      return res.status(400).json({ error: 'Please paste an API key or update a configuration field before saving.' });
+    }
+
+    payload.updated_at = new Date().toISOString();
+
+    const { data, error } = await admin
+      .from('ai_providers')
+      .update(payload)
+      .eq('id', req.params.id)
+      .select('id, slug, name, provider_type, base_url, api_key_encrypted, is_active, priority')
+      .single();
+    if (error) return res.status(400).json({ error: error.message });
+
+    if (cleanKey) {
+      await ensureDefaultModelForProvider({
+        id: data.id,
+        provider_type: data.provider_type as 'gemini' | 'openai' | 'deepseek' | 'custom',
+        name: data.name,
+      });
+    }
+
+    await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_provider_updated', targetType: 'ai_provider', targetId: req.params.id, details: { name: data.name, is_active: data.is_active, keyUpdated: Boolean(cleanKey) } });
+    return res.json({
+      provider: {
+        id: data.id,
+        slug: data.slug,
+        name: data.name,
+        provider_type: data.provider_type,
+        base_url: data.base_url,
+        is_active: data.is_active,
+        priority: data.priority,
+        has_api_key: Boolean(data.api_key_encrypted && String(data.api_key_encrypted).trim().length > 0),
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update AI provider.' });
   }
-  const payload: Record<string, unknown> = {
-    ...(name !== undefined ? { name } : {}),
-    ...(base_url !== undefined ? { base_url } : {}),
-    ...(is_active !== undefined ? { is_active } : {}),
-    ...(priority !== undefined ? { priority: Number(priority) } : {}),
+});
+
+router.post('/ai/providers/:id/test', async (req, res) => {
+  const { api_key, base_url, model_id } = (req.body || {}) as {
+    api_key?: string;
+    base_url?: string;
+    model_id?: string;
   };
-  if (api_key && String(api_key).trim()) {
-    payload.api_key_encrypted = encryptSecret(String(api_key).trim());
-  }
-  const { data, error } = await admin
-    .from('ai_providers')
-    .update(payload)
-    .eq('id', req.params.id)
-    .select('id, slug, name, provider_type, base_url, api_key_encrypted, is_active, priority')
-    .single();
-  if (error) return res.status(400).json({ error: error.message });
-  await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_provider_updated', targetType: 'ai_provider', targetId: req.params.id, details: { name, is_active, keyUpdated: Boolean(api_key) } });
-  return res.json({
-    provider: {
-      id: data.id,
-      slug: data.slug,
-      name: data.name,
-      provider_type: data.provider_type,
-      base_url: data.base_url,
-      is_active: data.is_active,
-      priority: data.priority,
-      has_api_key: Boolean(data.api_key_encrypted),
-    },
+  const result = await testProviderConnection(req.params.id, {
+    apiKey: typeof api_key === 'string' && api_key.trim() ? api_key.trim() : undefined,
+    baseUrl: typeof base_url === 'string' && base_url.trim() ? base_url.trim() : undefined,
+    modelId: typeof model_id === 'string' && model_id.trim() ? model_id.trim() : undefined,
   });
+  return res.json(result);
 });
 
 router.post('/ai/models', async (req: AuthedRequest, res) => {
   const admin = getSupabaseAdmin();
   const b = req.body as Record<string, unknown>;
-  if (b.is_default) {
+  const provider_id = String(b.provider_id || '').trim();
+  const model_id = String(b.model_id || '').trim();
+  const display_name = String(b.display_name || '').trim();
+
+  if (!provider_id || !model_id || !display_name) {
+    return res.status(400).json({ error: 'Provider, Model ID, and Display Name are required.' });
+  }
+
+  const insertPayload = {
+    provider_id,
+    model_id,
+    display_name,
+    input_cost_per_1m: Number.isFinite(Number(b.input_cost_per_1m)) ? Number(b.input_cost_per_1m) : 0.15,
+    output_cost_per_1m: Number.isFinite(Number(b.output_cost_per_1m)) ? Number(b.output_cost_per_1m) : 0.6,
+    coins_per_usd: Number.isFinite(Number(b.coins_per_usd)) ? Number(b.coins_per_usd) : 1000,
+    max_tokens: Number.isFinite(Number(b.max_tokens)) ? Number(b.max_tokens) : 2048,
+    min_plan_slug: String(b.min_plan_slug || 'free'),
+    is_active: b.is_active !== false,
+    is_default: Boolean(b.is_default),
+    is_fallback: Boolean(b.is_fallback),
+    priority: Number.isFinite(Number(b.priority)) ? Number(b.priority) : 1,
+  };
+
+  if (insertPayload.is_default) {
     await admin.from('ai_models').update({ is_default: false }).neq('id', '00000000-0000-0000-0000-000000000000');
   }
-  const { data, error } = await admin.from('ai_models').insert(b).select('*').single();
+  const { data, error } = await admin.from('ai_models').insert(insertPayload).select('*, provider:ai_providers(id, slug, name)').single();
   if (error) return res.status(400).json({ error: error.message });
-  await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_model_created', targetType: 'ai_model', targetId: data.id, details: b });
+  await writeAuditLog({ actorId: req.user!.id, actorEmail: req.user!.email, actorRole: req.user!.role, action: 'ai_model_created', targetType: 'ai_model', targetId: data.id, details: insertPayload });
   return res.status(201).json({ model: data });
 });
 

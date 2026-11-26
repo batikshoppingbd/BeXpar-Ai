@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Bot, CheckCircle2, KeyRound, Plus, Sparkles, Trash2, Zap } from 'lucide-react';
+import { AlertCircle, Bot, CheckCircle2, Eye, EyeOff, KeyRound, Loader2, Plus, Sparkles, Trash2, Zap } from 'lucide-react';
 import { apiFetch } from '../../../lib/api';
 import type { Lang } from '../../../i18n/translations';
 import { adminT } from '../adminI18n';
@@ -17,11 +17,18 @@ export const AiProvidersView: React.FC<{
   const [loading, setLoading] = useState(true);
 
   const [keyInputs, setKeyInputs] = useState<Record<string, string>>({});
+  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
   const [baseUrlInputs, setBaseUrlInputs] = useState<Record<string, string>>({});
+  const [savingProviderId, setSavingProviderId] = useState<string | null>(null);
+  const [togglingProviderId, setTogglingProviderId] = useState<string | null>(null);
+  const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
+  const [providerFeedback, setProviderFeedback] = useState<Record<string, { ok: boolean; msg: string }>>({});
+
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [testingId, setTestingId] = useState<string | null>(null);
 
   const [newProviderOpen, setNewProviderOpen] = useState(false);
+  const [creatingProvider, setCreatingProvider] = useState(false);
   const [newProvider, setNewProvider] = useState({
     slug: '',
     name: '',
@@ -41,7 +48,10 @@ export const AiProvidersView: React.FC<{
     max_tokens: 2048,
     min_plan_slug: 'free',
   });
+  const [addingModel, setAddingModel] = useState(false);
+  const [modelFormError, setModelFormError] = useState('');
   const [editingModel, setEditingModel] = useState<AdminAiModel | null>(null);
+  const [savingEditModel, setSavingEditModel] = useState(false);
   const [deleteModelTarget, setDeleteModelTarget] = useState<AdminAiModel | null>(null);
 
   const load = async () => {
@@ -74,6 +84,96 @@ export const AiProvidersView: React.FC<{
     void load();
   }, []);
 
+  const handleSaveProvider = async (p: AdminAiProvider) => {
+    const cleanKey = (keyInputs[p.id] || '').trim();
+    const cleanUrl = p.provider_type !== 'gemini' ? (baseUrlInputs[p.id] ?? '').trim() : undefined;
+    const urlChanged = p.provider_type !== 'gemini' && cleanUrl !== (p.base_url || '');
+
+    if (!cleanKey && !urlChanged) {
+      const msg = lang === 'bn' ? 'আগে আপনার API Key পেস্ট করুন।' : 'Please paste your API key before clicking Save.';
+      setProviderFeedback((prev) => ({ ...prev, [p.id]: { ok: false, msg } }));
+      onError(msg);
+      return;
+    }
+
+    setSavingProviderId(p.id);
+    setProviderFeedback((prev) => {
+      const next = { ...prev };
+      delete next[p.id];
+      return next;
+    });
+    try {
+      await apiFetch(`/api/admin/ai/providers/${p.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          api_key: cleanKey || undefined,
+          base_url: urlChanged ? cleanUrl : undefined,
+        }),
+      });
+      setKeyInputs((prev) => ({ ...prev, [p.id]: '' }));
+      const msg =
+        lang === 'bn'
+          ? `${p.name}-এর API Key সেভ ও সক্রিয় করা হয়েছে।`
+          : `Saved & activated ${p.name} configuration.`;
+      setProviderFeedback((prev) => ({ ...prev, [p.id]: { ok: true, msg } }));
+      onNotify(msg);
+      await load();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to save provider.';
+      setProviderFeedback((prev) => ({ ...prev, [p.id]: { ok: false, msg } }));
+      onError(msg);
+    } finally {
+      setSavingProviderId(null);
+    }
+  };
+
+  const handleTestProvider = async (p: AdminAiProvider) => {
+    const cleanKey = (keyInputs[p.id] || '').trim();
+    if (!cleanKey && !p.has_api_key) {
+      const msg = lang === 'bn' ? 'টেস্ট করার আগে API Key দিন।' : 'Paste an API key first to test the connection.';
+      setProviderFeedback((prev) => ({ ...prev, [p.id]: { ok: false, msg } }));
+      return;
+    }
+
+    setTestingProviderId(p.id);
+    setProviderFeedback((prev) => {
+      const next = { ...prev };
+      delete next[p.id];
+      return next;
+    });
+    try {
+      const res = await apiFetch<{ ok: boolean; latencyMs: number; modelId?: string; sample?: string; error?: string }>(
+        `/api/admin/ai/providers/${p.id}/test`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            api_key: cleanKey || undefined,
+            base_url: p.provider_type !== 'gemini' ? (baseUrlInputs[p.id] || '').trim() || undefined : undefined,
+          }),
+        }
+      );
+      setProviderFeedback((prev) => ({
+        ...prev,
+        [p.id]: {
+          ok: res.ok,
+          msg: res.ok
+            ? `Connected (${res.latencyMs}ms · ${res.modelId || p.provider_type}): ${res.sample || 'OK'}`
+            : `Connection failed: ${res.error || 'Unknown error'}`,
+        },
+      }));
+    } catch (err) {
+      setProviderFeedback((prev) => ({
+        ...prev,
+        [p.id]: {
+          ok: false,
+          msg: err instanceof Error ? err.message : 'Provider connection test failed.',
+        },
+      }));
+    } finally {
+      setTestingProviderId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Providers Header */}
@@ -99,104 +199,169 @@ export const AiProvidersView: React.FC<{
 
       {/* Providers Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {providers.map((p) => (
-          <div
-            key={p.id}
-            className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-3"
-          >
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <div className="text-sm font-display font-bold text-[#101536] dark:text-white">{p.name}</div>
-                <div className="text-[11px] font-mono text-[#7C8499]">
-                  {p.provider_type} · priority #{p.priority}
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <StatusBadge
-                  status={p.has_api_key ? 'active' : 'inactive'}
-                  label={p.has_api_key ? adminT(lang, 'configured') : adminT(lang, 'notConfigured')}
-                />
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await apiFetch(`/api/admin/ai/providers/${p.id}`, {
-                      method: 'PATCH',
-                      body: JSON.stringify({ is_active: !p.is_active }),
-                    });
-                    onNotify(`${p.name} ${!p.is_active ? 'enabled' : 'disabled'}.`);
-                    await load();
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold ${
-                    p.is_active
-                      ? 'bg-emerald-50 text-[#16B66A] dark:bg-emerald-950/40'
-                      : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
-                  }`}
-                >
-                  {p.is_active ? 'Enabled' : 'Disabled'}
-                </button>
-              </div>
-            </div>
+        {providers.map((p) => {
+          const fb = providerFeedback[p.id];
+          const isSaving = savingProviderId === p.id;
+          const isTesting = testingProviderId === p.id;
+          const isToggling = togglingProviderId === p.id;
+          const showKey = Boolean(showKeys[p.id]);
 
-            <div className="space-y-2 text-xs">
-              {p.provider_type !== 'gemini' && (
-                <input
-                  type="url"
-                  placeholder="Base URL (https://...)"
-                  value={baseUrlInputs[p.id] ?? p.base_url ?? ''}
-                  onChange={(e) => setBaseUrlInputs({ ...baseUrlInputs, [p.id]: e.target.value })}
-                  className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 font-mono text-[11px]"
-                />
-              )}
-              <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <KeyRound className="w-3.5 h-3.5 text-[#7C8499] absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="password"
-                    placeholder={p.has_api_key ? '•••••••••••• (enter to rotate)' : 'Paste encrypted API key...'}
-                    value={keyInputs[p.id] || ''}
-                    onChange={(e) => setKeyInputs({ ...keyInputs, [p.id]: e.target.value })}
-                    className="w-full pl-8 pr-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 text-xs"
-                  />
+          return (
+            <div
+              key={p.id}
+              className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-3"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-sm font-display font-bold text-[#101536] dark:text-white">{p.name}</div>
+                  <div className="text-[11px] font-mono text-[#7C8499]">
+                    {p.provider_type} · priority #{p.priority}
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      await apiFetch(`/api/admin/ai/providers/${p.id}`, {
-                        method: 'PATCH',
-                        body: JSON.stringify({
-                          api_key: keyInputs[p.id] || undefined,
-                          base_url: p.provider_type !== 'gemini' ? baseUrlInputs[p.id] : undefined,
-                        }),
-                      });
-                      setKeyInputs({ ...keyInputs, [p.id]: '' });
-                      onNotify(`Saved configuration for ${p.name}.`);
-                      await load();
-                    } catch (err) {
-                      onError(err instanceof Error ? err.message : 'Failed to save provider.');
-                    }
-                  }}
-                  className="px-3.5 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold hover:bg-[#4520D9]"
-                >
-                  Save
-                </button>
+                <div className="flex items-center gap-2">
+                  <StatusBadge
+                    status={p.has_api_key ? 'active' : 'inactive'}
+                    label={p.has_api_key ? adminT(lang, 'configured') : adminT(lang, 'notConfigured')}
+                  />
+                  <button
+                    type="button"
+                    disabled={isToggling}
+                    onClick={async () => {
+                      setTogglingProviderId(p.id);
+                      try {
+                        await apiFetch(`/api/admin/ai/providers/${p.id}`, {
+                          method: 'PATCH',
+                          body: JSON.stringify({ is_active: !p.is_active }),
+                        });
+                        onNotify(`${p.name} ${!p.is_active ? 'enabled' : 'disabled'}.`);
+                        await load();
+                      } catch (err) {
+                        const msg = err instanceof Error ? err.message : 'Failed to toggle provider.';
+                        setProviderFeedback((prev) => ({ ...prev, [p.id]: { ok: false, msg } }));
+                        onError(msg);
+                      } finally {
+                        setTogglingProviderId(null);
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold disabled:opacity-60 ${
+                      p.is_active
+                        ? 'bg-emerald-50 text-[#16B66A] dark:bg-emerald-950/40'
+                        : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+                    }`}
+                  >
+                    {isToggling ? '...' : p.is_active ? 'Enabled' : 'Disabled'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2 text-xs">
+                {p.provider_type !== 'gemini' && (
+                  <input
+                    type="url"
+                    placeholder="Base URL (https://...)"
+                    value={baseUrlInputs[p.id] ?? p.base_url ?? ''}
+                    onChange={(e) => setBaseUrlInputs({ ...baseUrlInputs, [p.id]: e.target.value })}
+                    className="w-full px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 font-mono text-[11px]"
+                  />
+                )}
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <KeyRound className="w-3.5 h-3.5 text-[#7C8499] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type={showKey ? 'text' : 'password'}
+                      autoComplete="new-password"
+                      placeholder={
+                        p.has_api_key
+                          ? '•••••••••••• (paste new key to rotate)'
+                          : p.provider_type === 'gemini'
+                          ? 'Paste Gemini API key (AIza...)'
+                          : 'Paste API key (sk-...)'
+                      }
+                      value={keyInputs[p.id] || ''}
+                      onChange={(e) => setKeyInputs({ ...keyInputs, [p.id]: e.target.value })}
+                      className="w-full pl-8 pr-9 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowKeys((prev) => ({ ...prev, [p.id]: !prev[p.id] }))}
+                      aria-label={showKey ? 'Hide API key' : 'Show API key'}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#7C8499] hover:text-[#101536] dark:hover:text-white"
+                    >
+                      {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => void handleSaveProvider(p)}
+                    className="px-3.5 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold hover:bg-[#4520D9] disabled:opacity-60 inline-flex items-center gap-1.5 shrink-0"
+                  >
+                    {isSaving && <Loader2 className="w-3 h-3 animate-spin" />}
+                    <span>{isSaving ? 'Saving...' : 'Save'}</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between pt-0.5">
+                  <button
+                    type="button"
+                    disabled={isTesting}
+                    onClick={() => void handleTestProvider(p)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-[11px] font-semibold hover:bg-[#E6E0FF]/70 disabled:opacity-60"
+                  >
+                    {isTesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                    <span>{isTesting ? 'Testing...' : adminT(lang, 'testConnection')}</span>
+                  </button>
+                  {p.has_api_key && (
+                    <span className="text-[11px] text-[#16B66A] inline-flex items-center gap-1 font-medium">
+                      <CheckCircle2 className="w-3 h-3" />
+                      <span>Key active</span>
+                    </span>
+                  )}
+                </div>
+
+                {fb && (
+                  <div
+                    className={`rounded-xl px-2.5 py-2 text-[11px] font-medium flex items-start gap-1.5 ${
+                      fb.ok
+                        ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300'
+                        : 'bg-rose-50 text-rose-700 dark:bg-rose-950/30 dark:text-rose-300'
+                    }`}
+                  >
+                    {fb.ok ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    )}
+                    <span className="break-words">{fb.msg}</span>
+                  </div>
+                )}
               </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Add New AI Model */}
       <form
         onSubmit={async (e) => {
           e.preventDefault();
+          setModelFormError('');
+          setAddingModel(true);
           try {
-            await apiFetch('/api/admin/ai/models', { method: 'POST', body: JSON.stringify(newModel) });
+            const payload = {
+              ...newModel,
+              provider_id: newModel.provider_id || providers[0]?.id || '',
+            };
+            await apiFetch('/api/admin/ai/models', { method: 'POST', body: JSON.stringify(payload) });
             setNewModel({ ...newModel, model_id: '', display_name: '' });
             onNotify('AI model added.');
             await load();
           } catch (err) {
-            onError(err instanceof Error ? err.message : 'Failed to create model.');
+            const msg = err instanceof Error ? err.message : 'Failed to create model.';
+            setModelFormError(msg);
+            onError(msg);
+          } finally {
+            setAddingModel(false);
           }
         }}
         className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-3"
@@ -205,7 +370,12 @@ export const AiProvidersView: React.FC<{
           <Sparkles className="w-4 h-4 text-[#5B35F5]" />
           <span>Add AI Model</span>
         </h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5 text-xs">
+        {modelFormError && (
+          <div className="rounded-xl bg-rose-50 dark:bg-rose-950/30 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+            {modelFormError}
+          </div>
+        )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-2.5 text-xs">
           <select
             value={newModel.provider_id}
             onChange={(e) => setNewModel({ ...newModel, provider_id: e.target.value })}
@@ -237,20 +407,36 @@ export const AiProvidersView: React.FC<{
             type="number"
             step="0.01"
             placeholder="Input $/1M"
+            title="Input $/1M tokens"
             value={newModel.input_cost_per_1m}
             onChange={(e) => setNewModel({ ...newModel, input_cost_per_1m: Number(e.target.value) })}
             className="px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
           />
           <input
             type="number"
+            step="0.01"
+            placeholder="Output $/1M"
+            title="Output $/1M tokens"
+            value={newModel.output_cost_per_1m}
+            onChange={(e) => setNewModel({ ...newModel, output_cost_per_1m: Number(e.target.value) })}
+            className="px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
+          />
+          <input
+            type="number"
             step="1"
             placeholder="Coins per USD"
+            title="Coins per $1 USD"
             value={newModel.coins_per_usd}
             onChange={(e) => setNewModel({ ...newModel, coins_per_usd: Number(e.target.value) })}
             className="px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950"
           />
-          <button type="submit" className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold hover:bg-[#4520D9]">
-            Add Model
+          <button
+            type="submit"
+            disabled={addingModel}
+            className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold hover:bg-[#4520D9] disabled:opacity-60 inline-flex items-center justify-center gap-1.5"
+          >
+            {addingModel && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+            <span>{addingModel ? 'Adding...' : 'Add Model'}</span>
           </button>
         </div>
       </form>
@@ -326,6 +512,14 @@ export const AiProvidersView: React.FC<{
                                     : `Error: ${res.error}`,
                                 },
                               });
+                            } catch (err) {
+                              setTestResults({
+                                ...testResults,
+                                [m.id]: {
+                                  ok: false,
+                                  msg: err instanceof Error ? err.message : 'Test request failed.',
+                                },
+                              });
                             } finally {
                               setTestingId(null);
                             }
@@ -339,12 +533,16 @@ export const AiProvidersView: React.FC<{
                           <button
                             type="button"
                             onClick={async () => {
-                              await apiFetch(`/api/admin/ai/models/${m.id}`, {
-                                method: 'PATCH',
-                                body: JSON.stringify({ is_default: true }),
-                              });
-                              onNotify(`${m.display_name} set as primary default model.`);
-                              await load();
+                              try {
+                                await apiFetch(`/api/admin/ai/models/${m.id}`, {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({ is_default: true }),
+                                });
+                                onNotify(`${m.display_name} set as primary default model.`);
+                                await load();
+                              } catch (err) {
+                                onError(err instanceof Error ? err.message : 'Failed to set default model.');
+                              }
                             }}
                             className="px-2.5 py-1.5 rounded-lg bg-[#5B35F5] text-white font-semibold"
                           >
@@ -421,16 +619,20 @@ export const AiProvidersView: React.FC<{
         <form
           onSubmit={async (e) => {
             e.preventDefault();
+            setCreatingProvider(true);
             try {
               await apiFetch('/api/admin/ai/providers', {
                 method: 'POST',
                 body: JSON.stringify(newProvider),
               });
               setNewProviderOpen(false);
+              setNewProvider({ slug: '', name: '', provider_type: 'custom', base_url: '', api_key: '', priority: 4 });
               onNotify('AI provider created.');
               await load();
             } catch (err) {
               onError(err instanceof Error ? err.message : 'Failed to add provider.');
+            } finally {
+              setCreatingProvider(false);
             }
           }}
           className="space-y-3 text-xs"
@@ -504,8 +706,12 @@ export const AiProvidersView: React.FC<{
             >
               {adminT(lang, 'cancel')}
             </button>
-            <button type="submit" className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold">
-              Add Provider
+            <button
+              type="submit"
+              disabled={creatingProvider}
+              className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold disabled:opacity-60"
+            >
+              {creatingProvider ? 'Adding...' : 'Add Provider'}
             </button>
           </div>
         </form>
@@ -522,22 +728,29 @@ export const AiProvidersView: React.FC<{
           <form
             onSubmit={async (e) => {
               e.preventDefault();
-              await apiFetch(`/api/admin/ai/models/${editingModel.id}`, {
-                method: 'PATCH',
-                body: JSON.stringify({
-                  display_name: editingModel.display_name,
-                  input_cost_per_1m: Number(editingModel.input_cost_per_1m),
-                  output_cost_per_1m: Number(editingModel.output_cost_per_1m),
-                  coins_per_usd: Number(editingModel.coins_per_usd),
-                  max_tokens: Number(editingModel.max_tokens),
-                  is_active: editingModel.is_active,
-                  is_fallback: editingModel.is_fallback,
-                  min_plan_slug: editingModel.min_plan_slug,
-                }),
-              });
-              setEditingModel(null);
-              onNotify('AI model updated.');
-              await load();
+              setSavingEditModel(true);
+              try {
+                await apiFetch(`/api/admin/ai/models/${editingModel.id}`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({
+                    display_name: editingModel.display_name,
+                    input_cost_per_1m: Number(editingModel.input_cost_per_1m),
+                    output_cost_per_1m: Number(editingModel.output_cost_per_1m),
+                    coins_per_usd: Number(editingModel.coins_per_usd),
+                    max_tokens: Number(editingModel.max_tokens),
+                    is_active: editingModel.is_active,
+                    is_fallback: editingModel.is_fallback,
+                    min_plan_slug: editingModel.min_plan_slug,
+                  }),
+                });
+                setEditingModel(null);
+                onNotify('AI model updated.');
+                await load();
+              } catch (err) {
+                onError(err instanceof Error ? err.message : 'Failed to update AI model.');
+              } finally {
+                setSavingEditModel(false);
+              }
             }}
             className="space-y-3 text-xs"
           >
@@ -616,8 +829,12 @@ export const AiProvidersView: React.FC<{
               >
                 {adminT(lang, 'cancel')}
               </button>
-              <button type="submit" className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold">
-                {adminT(lang, 'saveChanges')}
+              <button
+                type="submit"
+                disabled={savingEditModel}
+                className="px-4 py-2 rounded-xl bg-[#5B35F5] text-white font-semibold disabled:opacity-60"
+              >
+                {savingEditModel ? 'Saving...' : adminT(lang, 'saveChanges')}
               </button>
             </div>
           </form>
@@ -633,10 +850,14 @@ export const AiProvidersView: React.FC<{
         onCancel={() => setDeleteModelTarget(null)}
         onConfirm={async () => {
           if (!deleteModelTarget) return;
-          await apiFetch(`/api/admin/ai/models/${deleteModelTarget.id}`, { method: 'DELETE' });
-          setDeleteModelTarget(null);
-          onNotify('AI model deleted.');
-          await load();
+          try {
+            await apiFetch(`/api/admin/ai/models/${deleteModelTarget.id}`, { method: 'DELETE' });
+            setDeleteModelTarget(null);
+            onNotify('AI model deleted.');
+            await load();
+          } catch (err) {
+            onError(err instanceof Error ? err.message : 'Failed to delete model.');
+          }
         }}
       />
     </div>

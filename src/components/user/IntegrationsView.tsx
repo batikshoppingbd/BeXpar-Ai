@@ -67,12 +67,14 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
     metaConfigured: boolean;
     metaMode: string;
     metaApiVersion: string;
+    webhookUrl?: string;
     connections: Array<{ id: string; platform: string; account_id: string; account_name: string; status: string; token_expires_at?: string; connected_at: string }>;
-    facebookPages: Array<{ id: string; page_id: string; page_name: string; page_picture: string; is_active: boolean; connected_at: string }>;
+    facebookPages: Array<{ id: string; page_id: string; page_name: string; page_picture: string; is_active: boolean; webhook_subscribed?: boolean; connected_at: string }>;
     instagramAccounts: Array<{ id: string; ig_account_id: string; username: string; account_type: string; profile_picture: string; is_active: boolean }>;
-    whatsappAccounts: Array<{ id: string; waba_id: string; phone_number_id: string; display_phone_number: string; business_name: string; is_active: boolean }>;
+    whatsappAccounts: Array<{ id: string; waba_id: string; phone_number_id: string; display_phone_number: string; business_name: string; webhook_configured?: boolean; is_active: boolean }>;
     logs: Array<{ id: string; platform: string; event_type: string; status: string; message: string; created_at: string }>;
   } | null>(null);
+  const [syncingSocial, setSyncingSocial] = useState(false);
 
   // Courier state
   const [steadfastAccount, setSteadfastAccount] = useState<SafeCourierAccount | null>(null);
@@ -252,6 +254,39 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to disconnect account.');
+    }
+  };
+
+  const handleSyncSocial = async () => {
+    setError('');
+    setNotice('');
+    setSyncingSocial(true);
+    try {
+      const res = await apiFetch<{
+        syncedConversations: number;
+        syncedMessages: number;
+        aiRepliesSent: number;
+        webhookSubscribedPages: number;
+        warnings: string[];
+      }>(`/api/businesses/${business.id}/social/sync-inbox`, {
+        method: 'POST',
+        businessId: business.id,
+        body: JSON.stringify({ triggerAutoReply: true }),
+      });
+      await loadData();
+      if (res.warnings?.length) {
+        setError(res.warnings[0]);
+      } else {
+        setNotice(
+          lang === 'bn'
+            ? `Webhook ও চ্যাট সিঙ্ক সম্পন্ন: ${res.webhookSubscribedPages}টি পেজ সাবস্ক্রাইব, ${res.syncedMessages}টি মেসেজ সিঙ্ক এবং ${res.aiRepliesSent}টি AI রিপ্লাই পাঠানো হয়েছে।`
+            : `Synced ${res.webhookSubscribedPages} page webhook(s), ${res.syncedMessages} message(s), and ${res.aiRepliesSent} AI auto-reply(ies).`
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to sync Meta webhooks & chats.');
+    } finally {
+      setSyncingSocial(false);
     }
   };
 
@@ -677,63 +712,119 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ business, la
           </div>
 
           {/* Connected Accounts */}
-          <div className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card">
-            <h2 className="text-sm font-display font-bold mb-3">Connected Social Accounts ({socialData?.connections.length || 0})</h2>
+          <div className="bg-white dark:bg-slate-900 border border-[#E6E0FF] dark:border-slate-800 rounded-2xl p-5 bx-card space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-sm font-display font-bold">Connected Social Accounts ({socialData?.connections.length || 0})</h2>
+              <button
+                type="button"
+                disabled={syncingSocial}
+                onClick={() => void handleSyncSocial()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-xs font-semibold hover:bg-[#E6E0FF]/70 disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${syncingSocial ? 'animate-spin' : ''}`} />
+                <span>{syncingSocial ? 'Syncing...' : lang === 'bn' ? 'Webhook ও চ্যাট সিঙ্ক' : 'Sync Webhooks & Chats'}</span>
+              </button>
+            </div>
+
+            {socialData?.webhookUrl && (
+              <div className="rounded-xl bg-[#F8F9FC] dark:bg-slate-950 border border-[#E6E0FF] dark:border-slate-800 p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="min-w-0">
+                  <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">Meta Webhook Callback URL</div>
+                  <div className="font-mono text-slate-800 dark:text-slate-200 truncate">{socialData.webhookUrl}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(socialData.webhookUrl!);
+                      setCopiedCred('meta-webhook');
+                      setTimeout(() => setCopiedCred((p) => (p === 'meta-webhook' ? null : p)), 1800);
+                    } catch {
+                      setError('Clipboard copy failed.');
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-[#E6E0FF] dark:border-slate-700 text-xs font-semibold hover:bg-white dark:hover:bg-slate-800 shrink-0"
+                >
+                  {copiedCred === 'meta-webhook' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedCred === 'meta-webhook' ? 'Copied' : 'Copy URL'}</span>
+                </button>
+              </div>
+            )}
+
             {!socialData?.connections.length ? (
               <p className="text-xs text-slate-400 py-4">No channels connected yet.</p>
             ) : (
               <div className="divide-y divide-[#E6E0FF]/60 dark:divide-slate-800">
-                {socialData.connections.map((conn) => (
-                  <div key={conn.id} className="py-3 flex flex-wrap items-center justify-between gap-3 text-sm">
-                    <div>
-                      <div className="font-semibold text-slate-900 dark:text-white">{conn.account_name}</div>
-                      <div className="text-xs text-slate-500 font-mono">
-                        {conn.platform.toUpperCase()} · ID: {conn.account_id} · Connected {new Date(conn.connected_at).toLocaleDateString()}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className={`text-xs font-medium inline-flex items-center gap-1 ${conn.status === 'connected' ? 'text-emerald-600' : 'text-amber-600'}`}>
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span className="capitalize">{conn.status}</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => void handleMetaConnect(conn.platform as 'facebook' | 'instagram' | 'whatsapp')}
-                        className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs inline-flex items-center gap-1"
-                      >
-                        <RefreshCw className="w-3 h-3" />
-                        <span>Reconnect</span>
-                      </button>
-                      {confirmDisconnectId === conn.id ? (
-                        <div className="inline-flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => void handleDisconnect(conn.id)}
-                            className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-xs font-medium"
-                          >
-                            Confirm Disconnect
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDisconnectId(null)}
-                            className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs"
-                          >
-                            Cancel
-                          </button>
+                {socialData.connections.map((conn) => {
+                  const fbMatch = conn.platform === 'facebook' ? socialData.facebookPages.find((fp) => fp.page_id === conn.account_id) : undefined;
+                  const waMatch = conn.platform === 'whatsapp' ? socialData.whatsappAccounts.find((wa) => wa.phone_number_id === conn.account_id) : undefined;
+                  const webhookOk = conn.platform === 'facebook' ? fbMatch?.webhook_subscribed : conn.platform === 'whatsapp' ? waMatch?.webhook_configured : true;
+
+                  return (
+                    <div key={conn.id} className="py-3 flex flex-wrap items-center justify-between gap-3 text-sm">
+                      <div>
+                        <div className="font-semibold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
+                          <span>{conn.account_name}</span>
+                          {conn.status === 'connected' && (
+                            <span
+                              className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                                webhookOk
+                                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                                  : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                              }`}
+                            >
+                              {webhookOk ? 'Webhook Subscribed' : 'Webhook Pending'}
+                            </span>
+                          )}
                         </div>
-                      ) : (
+                        <div className="text-xs text-slate-500 font-mono">
+                          {conn.platform.toUpperCase()} · ID: {conn.account_id} · Connected {new Date(conn.connected_at).toLocaleDateString()}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs font-medium inline-flex items-center gap-1 ${conn.status === 'connected' ? 'text-emerald-600' : 'text-amber-600'}`}>
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span className="capitalize">{conn.status}</span>
+                        </span>
                         <button
                           type="button"
-                          onClick={() => setConfirmDisconnectId(conn.id)}
-                          className="px-2.5 py-1 rounded-lg border border-rose-200 text-rose-600 text-xs inline-flex items-center gap-1"
+                          onClick={() => void handleMetaConnect(conn.platform as 'facebook' | 'instagram' | 'whatsapp')}
+                          className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs inline-flex items-center gap-1"
                         >
-                          <Unplug className="w-3 h-3" />
-                          <span>Disconnect</span>
+                          <RefreshCw className="w-3 h-3" />
+                          <span>Reconnect</span>
                         </button>
-                      )}
+                        {confirmDisconnectId === conn.id ? (
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => void handleDisconnect(conn.id)}
+                              className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-xs font-medium"
+                            >
+                              Confirm Disconnect
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDisconnectId(null)}
+                              className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDisconnectId(conn.id)}
+                            className="px-2.5 py-1 rounded-lg border border-rose-200 text-rose-600 text-xs inline-flex items-center gap-1"
+                          >
+                            <Unplug className="w-3 h-3" />
+                            <span>Disconnect</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

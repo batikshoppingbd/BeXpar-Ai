@@ -24,11 +24,14 @@ import {
 import {
   createMetaOAuthUrl,
   dispatchChannelReply,
+  fetchMetaSenderProfile,
   getPlatformMetaConfig,
   handleMetaOAuthCallback,
   resolveAppBaseUrl,
+  resolveMetaChannelToken,
   sendMetaCapiEvent,
-  verifyMetaWebhookSignature,
+  syncMetaConversationsForBusiness,
+  verifyMetaWebhookBodyWithFallback,
 } from '../services/metaService.ts';
 import { broadcastToBusiness } from '../services/realtimeBus.ts';
 
@@ -102,6 +105,7 @@ router.get('/businesses/:businessId/social', requireAuth, requireBusinessAccess(
       metaConfigured: Boolean(metaCfg.appId && metaCfg.appSecret),
       metaMode: metaCfg.mode,
       metaApiVersion: metaCfg.apiVersion,
+      webhookUrl: `${resolveAppBaseUrl(req)}/api/webhooks/meta`,
       connections: connections || [],
       facebookPages: fbPages || [],
       instagramAccounts: igAccounts || [],
@@ -110,6 +114,16 @@ router.get('/businesses/:businessId/social', requireAuth, requireBusinessAccess(
     });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load social connections.' });
+  }
+});
+
+router.post('/businesses/:businessId/social/sync-inbox', requireAuth, requireBusinessAccess('inbox'), async (req: AuthedRequest, res) => {
+  try {
+    const triggerAutoReply = Boolean((req.body as { triggerAutoReply?: boolean } | undefined)?.triggerAutoReply);
+    const result = await syncMetaConversationsForBusiness(req.businessId!, { triggerAutoReply });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to sync Meta inbox.' });
   }
 });
 
@@ -234,12 +248,15 @@ router.get('/webhooks/meta', async (req, res) => {
 router.post('/webhooks/meta', async (req, res) => {
   try {
     const signature = req.headers['x-hub-signature-256'] as string | undefined;
-    const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody || JSON.stringify(req.body);
-    const sigValid = await verifyMetaWebhookSignature(rawBody, signature);
-    const metaCfg = await getPlatformMetaConfig();
+    const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody;
+    const sigCheck = await verifyMetaWebhookBodyWithFallback({
+      rawBody,
+      parsedBody: req.body,
+      signatureHeader: signature,
+    });
 
-    if (metaCfg.appSecret && signature && !sigValid) {
-      return res.status(401).json({ error: 'Invalid Meta webhook signature.' });
+    if (!sigCheck.valid) {
+      return res.status(401).json({ error: sigCheck.reason || 'Invalid Meta webhook signature.' });
     }
 
     const payload = req.body as {
@@ -250,7 +267,13 @@ router.post('/webhooks/meta', async (req, res) => {
           sender?: { id?: string };
           recipient?: { id?: string };
           timestamp?: number;
-          message?: { mid?: string; text?: string };
+          message?: {
+            mid?: string;
+            text?: string;
+            is_echo?: boolean;
+            attachments?: Array<{ type?: string }>;
+          };
+          postback?: { mid?: string; title?: string; payload?: string };
         }>;
         changes?: Array<{
           field?: string;
@@ -270,96 +293,189 @@ router.post('/webhooks/meta', async (req, res) => {
       if (entry.messaging) {
         const channel = payload.object === 'instagram' ? 'instagram' : 'facebook';
         for (const msgEvent of entry.messaging) {
-          const text = msgEvent.message?.text;
-          const mid = msgEvent.message?.mid;
+          if (msgEvent.message?.is_echo) continue;
+
+          const text =
+            msgEvent.message?.text?.trim() ||
+            msgEvent.postback?.title?.trim() ||
+            (msgEvent.message?.attachments?.length ? '[Attachment]' : '');
+          const mid = msgEvent.message?.mid || msgEvent.postback?.mid || `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const senderId = msgEvent.sender?.id;
           const recipientId = msgEvent.recipient?.id;
-          if (!text || !mid || !senderId || !recipientId) continue;
+          if (!text || !senderId || (!recipientId && !entry.id)) continue;
+
+          const candidateAccountIds = Array.from(new Set([recipientId, entry.id].filter((v): v is string => Boolean(v))));
+          if (candidateAccountIds.includes(senderId)) continue;
+
+          // Match business connection via social_connections, facebook_pages, or instagram_accounts
+          let matchedBusinessId: string | null = null;
+          let matchedAccountId = recipientId || entry.id || '';
+
+          const { data: conn } = await admin
+            .from('social_connections')
+            .select('business_id, account_id')
+            .eq('platform', channel)
+            .in('account_id', candidateAccountIds)
+            .eq('status', 'connected')
+            .limit(1)
+            .maybeSingle();
+
+          if (conn) {
+            matchedBusinessId = conn.business_id;
+            matchedAccountId = conn.account_id;
+          } else if (channel === 'facebook') {
+            const { data: fbPage } = await admin
+              .from('facebook_pages')
+              .select('business_id, page_id')
+              .in('page_id', candidateAccountIds)
+              .eq('is_active', true)
+              .limit(1)
+              .maybeSingle();
+            if (fbPage) {
+              matchedBusinessId = fbPage.business_id;
+              matchedAccountId = fbPage.page_id;
+            }
+          } else if (channel === 'instagram') {
+            const { data: igAcc } = await admin
+              .from('instagram_accounts')
+              .select('business_id, ig_account_id, linked_page_id')
+              .or(candidateAccountIds.map((id) => `ig_account_id.eq.${id},linked_page_id.eq.${id}`).join(','))
+              .eq('is_active', true)
+              .limit(1)
+              .maybeSingle();
+            if (igAcc) {
+              matchedBusinessId = igAcc.business_id;
+              matchedAccountId = igAcc.ig_account_id;
+            }
+          }
+
+          if (!matchedBusinessId) continue;
 
           // Event Deduplication
           const { error: dupErr } = await admin.from('social_webhook_events').insert({
+            business_id: matchedBusinessId,
             platform: channel,
             event_id: `${channel}_${mid}`,
             payload: msgEvent,
           });
           if (dupErr) continue;
 
-          const { data: conn } = await admin
-            .from('social_connections')
-            .select('business_id')
-            .eq('platform', channel)
-            .eq('account_id', recipientId)
-            .eq('status', 'connected')
-            .maybeSingle();
-
-          if (!conn) continue;
-
-          let { data: conv } = await admin
-            .from('conversations')
-            .select('*')
-            .eq('business_id', conn.business_id)
-            .eq('channel', channel)
-            .eq('external_thread_id', senderId)
-            .maybeSingle();
-
-          if (!conv) {
-            const { data: createdConv } = await admin
+          try {
+            let { data: conv } = await admin
               .from('conversations')
-              .insert({
-                business_id: conn.business_id,
-                channel,
-                external_thread_id: senderId,
-                channel_account_id: recipientId,
-                customer_name: `${channel.toUpperCase()} User ${senderId.slice(-4)}`,
-                last_message: text,
-                last_message_at: new Date().toISOString(),
-                unread_count: 1,
-                ai_enabled: true,
-              })
               .select('*')
-              .single();
-            conv = createdConv;
-          } else {
-            await admin
-              .from('conversations')
-              .update({
-                last_message: text,
-                last_message_at: new Date().toISOString(),
-                unread_count: (conv.unread_count || 0) + 1,
-              })
-              .eq('id', conv.id);
-          }
+              .eq('business_id', matchedBusinessId)
+              .eq('channel', channel)
+              .eq('external_thread_id', senderId)
+              .maybeSingle();
 
-          if (conv) {
-            const { data: savedMsg } = await admin
-              .from('messages')
-              .insert({
-                business_id: conn.business_id,
-                conversation_id: conv.id,
-                external_message_id: mid,
-                sender_type: 'customer',
-                content: text,
-                message_type: 'text',
-              })
-              .select('*')
-              .single();
+            let senderName = `${channel.toUpperCase()} User ${senderId.slice(-4)}`;
+            let senderAvatar = '';
 
-            if (savedMsg) broadcastToBusiness(conn.business_id, 'message:new', savedMsg);
-
-            const aiOut = await processCustomerMessageWithAi({
-              businessId: conn.business_id,
-              conversationId: conv.id,
-              customerMessage: text,
-            });
-            if (aiOut.replied && aiOut.replyText) {
-              await dispatchChannelReply({
-                businessId: conn.business_id,
+            if (!conv || !conv.customer_name || conv.customer_name.startsWith(`${channel.toUpperCase()} User `)) {
+              const { token } = await resolveMetaChannelToken({
+                businessId: matchedBusinessId,
                 channel,
-                channelAccountId: recipientId,
-                recipientId: senderId,
-                text: aiOut.replyText,
+                channelAccountId: matchedAccountId,
               });
+              if (token) {
+                const prof = await fetchMetaSenderProfile({ senderId, accessToken: token });
+                if (prof.name) senderName = prof.name;
+                if (prof.avatar) senderAvatar = prof.avatar;
+              }
             }
+
+            if (!conv) {
+              const { data: createdConv } = await admin
+                .from('conversations')
+                .insert({
+                  business_id: matchedBusinessId,
+                  channel,
+                  external_thread_id: senderId,
+                  channel_account_id: matchedAccountId,
+                  customer_name: senderName,
+                  customer_avatar: senderAvatar,
+                  last_message: text,
+                  last_message_at: new Date().toISOString(),
+                  unread_count: 1,
+                  ai_enabled: true,
+                })
+                .select('*')
+                .single();
+              conv = createdConv;
+            } else {
+              const { data: updatedConv } = await admin
+                .from('conversations')
+                .update({
+                  ...(senderName && conv.customer_name.startsWith(`${channel.toUpperCase()} User `)
+                    ? { customer_name: senderName }
+                    : {}),
+                  ...(senderAvatar ? { customer_avatar: senderAvatar } : {}),
+                  channel_account_id: matchedAccountId || conv.channel_account_id,
+                  last_message: text,
+                  last_message_at: new Date().toISOString(),
+                  unread_count: (conv.unread_count || 0) + 1,
+                })
+                .eq('id', conv.id)
+                .select('*')
+                .single();
+              if (updatedConv) conv = updatedConv;
+            }
+
+            if (conv) {
+              broadcastToBusiness(matchedBusinessId, 'conversation:updated', conv);
+
+              const { data: savedMsg } = await admin
+                .from('messages')
+                .insert({
+                  business_id: matchedBusinessId,
+                  conversation_id: conv.id,
+                  external_message_id: mid,
+                  sender_type: 'customer',
+                  content: text,
+                  message_type: 'text',
+                  delivery_status: 'delivered',
+                })
+                .select('*')
+                .single();
+
+              if (savedMsg) broadcastToBusiness(matchedBusinessId, 'message:new', savedMsg);
+
+              const aiOut = await processCustomerMessageWithAi({
+                businessId: matchedBusinessId,
+                conversationId: conv.id,
+                customerMessage: text,
+              });
+
+              if (aiOut.replied && aiOut.replyText) {
+                const dispatch = await dispatchChannelReply({
+                  businessId: matchedBusinessId,
+                  channel,
+                  channelAccountId: matchedAccountId,
+                  recipientId: senderId,
+                  text: aiOut.replyText,
+                });
+                if (!dispatch.delivered) {
+                  await admin.from('social_connection_logs').insert({
+                    business_id: matchedBusinessId,
+                    platform: channel,
+                    event_type: 'reply_dispatch_failed',
+                    status: 'error',
+                    message: dispatch.error || 'Failed to deliver AI reply to Meta.',
+                  });
+                }
+              } else if (aiOut.error) {
+                await admin.from('social_connection_logs').insert({
+                  business_id: matchedBusinessId,
+                  platform: channel,
+                  event_type: 'ai_reply_skipped',
+                  status: 'error',
+                  message: aiOut.error,
+                });
+              }
+            }
+          } catch (msgErr) {
+            console.error('[Meta Messenger/IG Event Error]', msgErr);
           }
         }
       }
@@ -381,7 +497,7 @@ router.post('/webhooks/meta', async (req, res) => {
           if (!waAcc) continue;
 
           for (const waMsg of val.messages) {
-            const text = waMsg.text?.body;
+            const text = waMsg.text?.body?.trim() || (waMsg.type && waMsg.type !== 'text' ? `[${waMsg.type}]` : '');
             const mid = waMsg.id;
             const from = waMsg.from;
             if (!text || !mid || !from) continue;
@@ -394,73 +510,100 @@ router.post('/webhooks/meta', async (req, res) => {
             });
             if (dupErr) continue;
 
-            const contactName = val.contacts?.[0]?.profile?.name || `WhatsApp ${from.slice(-4)}`;
-            let { data: conv } = await admin
-              .from('conversations')
-              .select('*')
-              .eq('business_id', waAcc.business_id)
-              .eq('channel', 'whatsapp')
-              .eq('external_thread_id', from)
-              .maybeSingle();
-
-            if (!conv) {
-              const { data: createdConv } = await admin
+            try {
+              const contactName = val.contacts?.[0]?.profile?.name || `WhatsApp ${from.slice(-4)}`;
+              let { data: conv } = await admin
                 .from('conversations')
-                .insert({
-                  business_id: waAcc.business_id,
-                  channel: 'whatsapp',
-                  external_thread_id: from,
-                  channel_account_id: phoneId,
-                  customer_name: contactName,
-                  last_message: text,
-                  last_message_at: new Date().toISOString(),
-                  unread_count: 1,
-                  ai_enabled: true,
-                })
                 .select('*')
-                .single();
-              conv = createdConv;
-            } else {
-              await admin
-                .from('conversations')
-                .update({
-                  last_message: text,
-                  last_message_at: new Date().toISOString(),
-                  unread_count: (conv.unread_count || 0) + 1,
-                })
-                .eq('id', conv.id);
-            }
+                .eq('business_id', waAcc.business_id)
+                .eq('channel', 'whatsapp')
+                .eq('external_thread_id', from)
+                .maybeSingle();
 
-            if (conv) {
-              const { data: savedMsg } = await admin
-                .from('messages')
-                .insert({
-                  business_id: waAcc.business_id,
-                  conversation_id: conv.id,
-                  external_message_id: mid,
-                  sender_type: 'customer',
-                  content: text,
-                  message_type: 'text',
-                })
-                .select('*')
-                .single();
-
-              if (savedMsg) broadcastToBusiness(waAcc.business_id, 'message:new', savedMsg);
-
-              const aiOut = await processCustomerMessageWithAi({
-                businessId: waAcc.business_id,
-                conversationId: conv.id,
-                customerMessage: text,
-              });
-              if (aiOut.replied && aiOut.replyText) {
-                await dispatchChannelReply({
-                  businessId: waAcc.business_id,
-                  channel: 'whatsapp',
-                  channelAccountId: phoneId,
-                  recipientId: from,
-                  text: aiOut.replyText,
-                });
+              if (!conv) {
+                const { data: createdConv } = await admin
+                  .from('conversations')
+                  .insert({
+                    business_id: waAcc.business_id,
+                    channel: 'whatsapp',
+                    external_thread_id: from,
+                    channel_account_id: phoneId,
+                    customer_name: contactName,
+                    last_message: text,
+                    last_message_at: new Date().toISOString(),
+                    unread_count: 1,
+                    ai_enabled: true,
+                  })
+                  .select('*')
+                  .single();
+                conv = createdConv;
+              } else {
+                const { data: updatedConv } = await admin
+                  .from('conversations')
+                  .update({
+                    last_message: text,
+                    last_message_at: new Date().toISOString(),
+                    unread_count: (conv.unread_count || 0) + 1,
+                  })
+                  .eq('id', conv.id)
+                  .select('*')
+                  .single();
+                if (updatedConv) conv = updatedConv;
               }
+
+              if (conv) {
+                broadcastToBusiness(waAcc.business_id, 'conversation:updated', conv);
+
+                const { data: savedMsg } = await admin
+                  .from('messages')
+                  .insert({
+                    business_id: waAcc.business_id,
+                    conversation_id: conv.id,
+                    external_message_id: mid,
+                    sender_type: 'customer',
+                    content: text,
+                    message_type: 'text',
+                    delivery_status: 'delivered',
+                  })
+                  .select('*')
+                  .single();
+
+                if (savedMsg) broadcastToBusiness(waAcc.business_id, 'message:new', savedMsg);
+
+                const aiOut = await processCustomerMessageWithAi({
+                  businessId: waAcc.business_id,
+                  conversationId: conv.id,
+                  customerMessage: text,
+                });
+                if (aiOut.replied && aiOut.replyText) {
+                  const dispatch = await dispatchChannelReply({
+                    businessId: waAcc.business_id,
+                    channel: 'whatsapp',
+                    channelAccountId: phoneId,
+                    recipientId: from,
+                    text: aiOut.replyText,
+                  });
+                  if (!dispatch.delivered) {
+                    await admin.from('social_connection_logs').insert({
+                      business_id: waAcc.business_id,
+                      platform: 'whatsapp',
+                      event_type: 'reply_dispatch_failed',
+                      status: 'error',
+                      message: dispatch.error || 'Failed to deliver WhatsApp AI reply.',
+                    });
+                  }
+                } else if (aiOut.error) {
+                  await admin.from('social_connection_logs').insert({
+                    business_id: waAcc.business_id,
+                    platform: 'whatsapp',
+                    event_type: 'ai_reply_skipped',
+                    status: 'error',
+                    message: aiOut.error,
+                  });
+                }
+              }
+            } catch (waErr) {
+              console.error('[Meta WhatsApp Event Error]', waErr);
             }
           }
         }

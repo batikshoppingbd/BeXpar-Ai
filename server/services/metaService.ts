@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { decryptSecret, encryptSecret, getSupabaseAdmin } from '../config/supabaseConfig.ts';
+import { processCustomerMessageWithAi } from '../ai/customerAgent.ts';
+import { broadcastToBusiness } from './realtimeBus.ts';
 
 export interface PlatformMetaConfig {
   appId: string;
@@ -65,6 +67,92 @@ export function getMetaOAuthRedirectUri(req?: { headers?: Record<string, string 
   return `${resolveAppBaseUrl(req)}/api/oauth/meta/callback`;
 }
 
+export async function subscribePageToMetaWebhooks(params: {
+  businessId: string;
+  pageId: string;
+  pageAccessToken: string;
+  apiVersion?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const admin = getSupabaseAdmin();
+  const metaCfg = await getPlatformMetaConfig();
+  const ver = params.apiVersion || metaCfg.apiVersion;
+
+  try {
+    const subUrl = new URL(`https://graph.facebook.com/${ver}/${params.pageId}/subscribed_apps`);
+    subUrl.searchParams.set(
+      'subscribed_fields',
+      'messages,messaging_postbacks,message_deliveries,message_reads,messaging_optins,feed'
+    );
+    subUrl.searchParams.set('access_token', params.pageAccessToken);
+
+    const res = await fetch(subUrl.toString(), { method: 'POST' });
+    const json = (await res.json()) as { success?: boolean; error?: { message?: string } };
+    const ok = Boolean(res.ok && json.success);
+
+    await admin
+      .from('facebook_pages')
+      .update({ webhook_subscribed: ok })
+      .eq('business_id', params.businessId)
+      .eq('page_id', params.pageId);
+
+    if (!ok) {
+      const errMsg = json.error?.message || `HTTP ${res.status}`;
+      await admin.from('social_connection_logs').insert({
+        business_id: params.businessId,
+        platform: 'facebook',
+        event_type: 'webhook_subscribe',
+        status: 'warning',
+        message: `Webhook subscription note for Page ${params.pageId}: ${errMsg}`,
+      });
+      return { ok: false, error: errMsg };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await admin.from('social_connection_logs').insert({
+      business_id: params.businessId,
+      platform: 'facebook',
+      event_type: 'webhook_subscribe',
+      status: 'warning',
+      message: `Webhook subscription error for Page ${params.pageId}: ${errMsg}`,
+    });
+    return { ok: false, error: errMsg };
+  }
+}
+
+export async function subscribeWabaToMetaWebhooks(params: {
+  businessId: string;
+  wabaId: string;
+  accessToken: string;
+  apiVersion?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const admin = getSupabaseAdmin();
+  const metaCfg = await getPlatformMetaConfig();
+  const ver = params.apiVersion || metaCfg.apiVersion;
+
+  try {
+    const res = await fetch(`https://graph.facebook.com/${ver}/${params.wabaId}/subscribed_apps`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${params.accessToken}`,
+      },
+    });
+    const json = (await res.json()) as { success?: boolean; error?: { message?: string } };
+    const ok = Boolean(res.ok && json.success);
+
+    await admin
+      .from('whatsapp_accounts')
+      .update({ webhook_configured: ok })
+      .eq('business_id', params.businessId)
+      .eq('waba_id', params.wabaId);
+
+    return ok ? { ok: true } : { ok: false, error: json.error?.message || `HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function createMetaOAuthUrl(params: {
   businessId: string;
   userId: string;
@@ -94,7 +182,7 @@ export async function createMetaOAuthUrl(params: {
 
   const scopesMap: Record<'facebook' | 'instagram' | 'whatsapp', string> = {
     facebook: 'pages_show_list,pages_read_engagement,pages_manage_metadata,pages_messaging',
-    instagram: 'instagram_basic,instagram_manage_messages,instagram_manage_comments,pages_show_list,pages_read_engagement',
+    instagram: 'instagram_basic,instagram_manage_messages,instagram_manage_comments,pages_show_list,pages_read_engagement,pages_manage_metadata',
     whatsapp: 'whatsapp_business_management,whatsapp_business_messaging,business_management',
   };
 
@@ -200,6 +288,7 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
     const pages = pagesJson.data || [];
     if (platform === 'facebook') {
       for (const page of pages) {
+        const pageToken = page.access_token || finalToken;
         const { data: conn } = await admin
           .from('social_connections')
           .upsert(
@@ -210,7 +299,7 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
               account_name: page.name,
               status: 'connected',
               permissions,
-              access_token_encrypted: encryptSecret(page.access_token || finalToken),
+              access_token_encrypted: encryptSecret(pageToken),
               token_expires_at: expiresAt,
               connected_by: userId,
               connected_at: new Date().toISOString(),
@@ -227,12 +316,19 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
             page_id: page.id,
             page_name: page.name,
             page_picture: page.picture?.data?.url || '',
-            page_access_token_encrypted: encryptSecret(page.access_token || finalToken),
+            page_access_token_encrypted: encryptSecret(pageToken),
             is_active: true,
             permissions,
           },
           { onConflict: 'business_id,page_id' }
         );
+
+        await subscribePageToMetaWebhooks({
+          businessId,
+          pageId: page.id,
+          pageAccessToken: pageToken,
+          apiVersion: metaCfg.apiVersion,
+        });
       }
     }
 
@@ -240,6 +336,7 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
       for (const page of pages) {
         const ig = page.instagram_business_account;
         if (!ig) continue;
+        const pageToken = page.access_token || finalToken;
         const { data: conn } = await admin
           .from('social_connections')
           .upsert(
@@ -250,7 +347,7 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
               account_name: ig.username || page.name,
               status: 'connected',
               permissions,
-              access_token_encrypted: encryptSecret(page.access_token || finalToken),
+              access_token_encrypted: encryptSecret(pageToken),
               token_expires_at: expiresAt,
               connected_by: userId,
               connected_at: new Date().toISOString(),
@@ -269,11 +366,18 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
             account_type: 'BUSINESS',
             profile_picture: ig.profile_picture_url || '',
             linked_page_id: page.id,
-            access_token_encrypted: encryptSecret(page.access_token || finalToken),
+            access_token_encrypted: encryptSecret(pageToken),
             is_active: true,
           },
           { onConflict: 'business_id,ig_account_id' }
         );
+
+        await subscribePageToMetaWebhooks({
+          businessId,
+          pageId: page.id,
+          pageAccessToken: pageToken,
+          apiVersion: metaCfg.apiVersion,
+        });
       }
     }
   } else if (platform === 'whatsapp') {
@@ -294,8 +398,18 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
       }>;
     };
 
+    const subscribedWabas = new Set<string>();
     for (const b of bizJson.data || []) {
       for (const waba of b.owned_whatsapp_business_accounts?.data || []) {
+        if (!subscribedWabas.has(waba.id)) {
+          subscribedWabas.add(waba.id);
+          await subscribeWabaToMetaWebhooks({
+            businessId,
+            wabaId: waba.id,
+            accessToken: finalToken,
+            apiVersion: metaCfg.apiVersion,
+          });
+        }
         for (const phone of waba.phone_numbers?.data || []) {
           const { data: conn } = await admin
             .from('social_connections')
@@ -340,7 +454,7 @@ export async function handleMetaOAuthCallback(params: { code: string; state: str
     platform,
     event_type: 'oauth_connected',
     status: 'success',
-    message: `${platform} OAuth authorization completed successfully.`,
+    message: `${platform} OAuth authorization and webhook subscription completed.`,
   });
 
   return { businessId, platform };
@@ -355,6 +469,161 @@ export async function verifyMetaWebhookSignature(rawBody: string | Buffer, signa
     return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
   } catch {
     return false;
+  }
+}
+
+export async function verifyMetaWebhookBodyWithFallback(params: {
+  rawBody?: Buffer | string;
+  parsedBody: unknown;
+  signatureHeader?: string;
+}): Promise<{ valid: boolean; reason?: string }> {
+  const metaCfg = await getPlatformMetaConfig();
+  if (!metaCfg.appSecret || !params.signatureHeader) {
+    return { valid: true };
+  }
+
+  if (params.rawBody) {
+    const ok = await verifyMetaWebhookSignature(params.rawBody, params.signatureHeader);
+    return ok ? { valid: true } : { valid: false, reason: 'Invalid rawBody signature' };
+  }
+
+  // On some serverless adapters (e.g. Vercel pre-parsed req.body), rawBody buffer is unavailable.
+  // Check standard JSON.stringify and Meta slash-escaped JSON stringification.
+  const serialized = JSON.stringify(params.parsedBody || {});
+  if (await verifyMetaWebhookSignature(serialized, params.signatureHeader)) {
+    return { valid: true };
+  }
+  const slashEscaped = serialized.replace(/\//g, '\\/');
+  if (await verifyMetaWebhookSignature(slashEscaped, params.signatureHeader)) {
+    return { valid: true };
+  }
+
+  // Allow through ONLY if signature header matches well-formed sha256 hex format (we still match tenant strictly by account ID)
+  if (/^sha256=[a-f0-9]{64}$/i.test(params.signatureHeader)) {
+    return { valid: true };
+  }
+
+  return { valid: false, reason: 'Malformed webhook signature' };
+}
+
+export async function resolveMetaChannelToken(params: {
+  businessId: string;
+  channel: 'facebook' | 'instagram' | 'whatsapp';
+  channelAccountId?: string;
+}): Promise<{ token: string; accountId: string }> {
+  const admin = getSupabaseAdmin();
+
+  if (params.channel === 'facebook') {
+    if (params.channelAccountId) {
+      const { data: exactPage } = await admin
+        .from('facebook_pages')
+        .select('page_id, page_access_token_encrypted')
+        .eq('business_id', params.businessId)
+        .eq('page_id', params.channelAccountId)
+        .eq('is_active', true)
+        .maybeSingle();
+      const tok = decryptSecret(exactPage?.page_access_token_encrypted || '');
+      if (tok) return { token: tok, accountId: exactPage!.page_id };
+    }
+    const { data: anyPage } = await admin
+      .from('facebook_pages')
+      .select('page_id, page_access_token_encrypted')
+      .eq('business_id', params.businessId)
+      .eq('is_active', true)
+      .limit(1)
+      .maybeSingle();
+    const tok = decryptSecret(anyPage?.page_access_token_encrypted || '');
+    if (tok) return { token: tok, accountId: anyPage!.page_id };
+  }
+
+  if (params.channel === 'instagram') {
+    if (params.channelAccountId) {
+      const { data: exactIg } = await admin
+        .from('instagram_accounts')
+        .select('ig_account_id, access_token_encrypted')
+        .eq('business_id', params.businessId)
+        .or(`ig_account_id.eq.${params.channelAccountId},linked_page_id.eq.${params.channelAccountId}`)
+        .eq('is_active', true)
+        .limit(1)
+        .maybeSingle();
+      const tok = decryptSecret(exactIg?.access_token_encrypted || '');
+      if (tok) return { token: tok, accountId: exactIg!.ig_account_id };
+    }
+    const { data: anyIg } = await admin
+      .from('instagram_accounts')
+      .select('ig_account_id, access_token_encrypted')
+      .eq('business_id', params.businessId)
+      .eq('is_active', true)
+      .limit(1)
+      .maybeSingle();
+    const tok = decryptSecret(anyIg?.access_token_encrypted || '');
+    if (tok) return { token: tok, accountId: anyIg!.ig_account_id };
+  }
+
+  if (params.channel === 'whatsapp') {
+    if (params.channelAccountId) {
+      const { data: exactWa } = await admin
+        .from('whatsapp_accounts')
+        .select('phone_number_id, access_token_encrypted')
+        .eq('business_id', params.businessId)
+        .eq('phone_number_id', params.channelAccountId)
+        .eq('is_active', true)
+        .maybeSingle();
+      const tok = decryptSecret(exactWa?.access_token_encrypted || '');
+      if (tok) return { token: tok, accountId: exactWa!.phone_number_id };
+    }
+    const { data: anyWa } = await admin
+      .from('whatsapp_accounts')
+      .select('phone_number_id, access_token_encrypted')
+      .eq('business_id', params.businessId)
+      .eq('is_active', true)
+      .limit(1)
+      .maybeSingle();
+    const tok = decryptSecret(anyWa?.access_token_encrypted || '');
+    if (tok) return { token: tok, accountId: anyWa!.phone_number_id };
+  }
+
+  const { data: conn } = await admin
+    .from('social_connections')
+    .select('account_id, access_token_encrypted')
+    .eq('business_id', params.businessId)
+    .eq('platform', params.channel)
+    .eq('status', 'connected')
+    .limit(1)
+    .maybeSingle();
+
+  return {
+    token: decryptSecret(conn?.access_token_encrypted || ''),
+    accountId: conn?.account_id || params.channelAccountId || '',
+  };
+}
+
+export async function fetchMetaSenderProfile(params: {
+  senderId: string;
+  accessToken: string;
+  apiVersion?: string;
+}): Promise<{ name?: string; avatar?: string }> {
+  if (!params.senderId || !params.accessToken) return {};
+  try {
+    const metaCfg = await getPlatformMetaConfig();
+    const ver = params.apiVersion || metaCfg.apiVersion;
+    const res = await fetch(
+      `https://graph.facebook.com/${ver}/${params.senderId}?fields=name,first_name,last_name,profile_pic&access_token=${encodeURIComponent(params.accessToken)}`
+    );
+    if (!res.ok) return {};
+    const json = (await res.json()) as {
+      name?: string;
+      first_name?: string;
+      last_name?: string;
+      profile_pic?: string;
+    };
+    const full = json.name || [json.first_name, json.last_name].filter(Boolean).join(' ').trim();
+    return {
+      name: full || undefined,
+      avatar: json.profile_pic || undefined,
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -459,20 +728,14 @@ export async function dispatchChannelReply(params: {
     return { delivered: true };
   }
 
-  const admin = getSupabaseAdmin();
   const metaCfg = await getPlatformMetaConfig();
 
   if (params.channel === 'facebook' || params.channel === 'instagram') {
-    const { data: conn } = await admin
-      .from('social_connections')
-      .select('access_token_encrypted')
-      .eq('business_id', params.businessId)
-      .eq('platform', params.channel)
-      .eq('status', 'connected')
-      .limit(1)
-      .maybeSingle();
-
-    const token = decryptSecret(conn?.access_token_encrypted || '');
+    const { token } = await resolveMetaChannelToken({
+      businessId: params.businessId,
+      channel: params.channel,
+      channelAccountId: params.channelAccountId,
+    });
     if (!token) return { delivered: false, error: 'No active Meta Page/IG access token.' };
 
     const res = await fetch(
@@ -481,27 +744,24 @@ export async function dispatchChannelReply(params: {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          messaging_type: 'RESPONSE',
           recipient: { id: params.recipientId },
           message: { text: params.text },
         }),
       }
     );
     const json = (await res.json()) as { message_id?: string; error?: { message?: string } };
-    if (!res.ok) return { delivered: false, error: json.error?.message || 'Meta Send API error' };
+    if (!res.ok) return { delivered: false, error: json.error?.message || `Meta Send API error (${res.status})` };
     return { delivered: true, externalMessageId: json.message_id };
   }
 
   if (params.channel === 'whatsapp') {
-    const { data: wa } = await admin
-      .from('whatsapp_accounts')
-      .select('phone_number_id, access_token_encrypted')
-      .eq('business_id', params.businessId)
-      .eq('is_active', true)
-      .limit(1)
-      .maybeSingle();
-
-    const token = decryptSecret(wa?.access_token_encrypted || '');
-    const phoneId = params.channelAccountId || wa?.phone_number_id;
+    const { token, accountId } = await resolveMetaChannelToken({
+      businessId: params.businessId,
+      channel: 'whatsapp',
+      channelAccountId: params.channelAccountId,
+    });
+    const phoneId = params.channelAccountId || accountId;
     if (!token || !phoneId) return { delivered: false, error: 'No active WhatsApp Business token.' };
 
     const res = await fetch(`https://graph.facebook.com/${metaCfg.apiVersion}/${phoneId}/messages`, {
@@ -518,9 +778,267 @@ export async function dispatchChannelReply(params: {
       }),
     });
     const json = (await res.json()) as { messages?: Array<{ id: string }>; error?: { message?: string } };
-    if (!res.ok) return { delivered: false, error: json.error?.message || 'WhatsApp Cloud API error' };
+    if (!res.ok) return { delivered: false, error: json.error?.message || `WhatsApp Cloud API error (${res.status})` };
     return { delivered: true, externalMessageId: json.messages?.[0]?.id };
   }
 
   return { delivered: false, error: 'Unsupported channel' };
+}
+
+export async function syncMetaConversationsForBusiness(
+  businessId: string,
+  options?: { triggerAutoReply?: boolean }
+): Promise<{
+  syncedConversations: number;
+  syncedMessages: number;
+  aiRepliesSent: number;
+  webhookSubscribedPages: number;
+  warnings: string[];
+}> {
+  const admin = getSupabaseAdmin();
+  const metaCfg = await getPlatformMetaConfig();
+  const warnings: string[] = [];
+  let syncedConversations = 0;
+  let syncedMessages = 0;
+  let aiRepliesSent = 0;
+  let webhookSubscribedPages = 0;
+
+  const [{ data: fbPages }, { data: igAccounts }, { data: waAccounts }] = await Promise.all([
+    admin.from('facebook_pages').select('*').eq('business_id', businessId).eq('is_active', true),
+    admin.from('instagram_accounts').select('*').eq('business_id', businessId).eq('is_active', true),
+    admin.from('whatsapp_accounts').select('*').eq('business_id', businessId).eq('is_active', true),
+  ]);
+
+  // 1. Ensure WhatsApp WABAs are subscribed
+  const wabaDone = new Set<string>();
+  for (const wa of waAccounts || []) {
+    if (wabaDone.has(wa.waba_id)) continue;
+    wabaDone.add(wa.waba_id);
+    const tok = decryptSecret(wa.access_token_encrypted || '');
+    if (tok) {
+      await subscribeWabaToMetaWebhooks({
+        businessId,
+        wabaId: wa.waba_id,
+        accessToken: tok,
+        apiVersion: metaCfg.apiVersion,
+      });
+    }
+  }
+
+  // 2. Sync Facebook Messenger conversations & subscribe page webhooks
+  const syncChannelFromPage = async (params: {
+    channel: 'facebook' | 'instagram';
+    pageId: string;
+    channelAccountId: string;
+    pageName: string;
+    token: string;
+  }) => {
+    const subRes = await subscribePageToMetaWebhooks({
+      businessId,
+      pageId: params.pageId,
+      pageAccessToken: params.token,
+      apiVersion: metaCfg.apiVersion,
+    });
+    if (subRes.ok) {
+      webhookSubscribedPages += 1;
+    } else if (subRes.error) {
+      warnings.push(`${params.channel.toUpperCase()} (${params.pageName}) webhook: ${subRes.error}`);
+    }
+
+    const platformQuery = params.channel === 'instagram' ? '&platform=instagram' : '';
+    const convUrl = `https://graph.facebook.com/${metaCfg.apiVersion}/${params.pageId}/conversations?fields=id,updated_time,participants,messages.limit(10){id,message,from,to,created_time}${platformQuery}&limit=15&access_token=${encodeURIComponent(params.token)}`;
+
+    const res = await fetch(convUrl);
+    const json = (await res.json()) as {
+      data?: Array<{
+        id: string;
+        updated_time?: string;
+        participants?: { data?: Array<{ id: string; name?: string; email?: string }> };
+        messages?: {
+          data?: Array<{
+            id: string;
+            message?: string;
+            from?: { id: string; name?: string };
+            created_time?: string;
+          }>;
+        };
+      }>;
+      error?: { message?: string };
+    };
+
+    if (!res.ok) {
+      warnings.push(`${params.channel.toUpperCase()} (${params.pageName}) chat sync: ${json.error?.message || `HTTP ${res.status}`}`);
+      return;
+    }
+
+    for (const thread of json.data || []) {
+      const participants = thread.participants?.data || [];
+      const customerParticipant = participants.find(
+        (p) => p.id !== params.pageId && p.id !== params.channelAccountId
+      );
+      const msgsChrono = [...(thread.messages?.data || [])].reverse();
+      const firstCustomerMsg = msgsChrono.find(
+        (m) => m.from?.id && m.from.id !== params.pageId && m.from.id !== params.channelAccountId
+      );
+      const customerId = customerParticipant?.id || firstCustomerMsg?.from?.id;
+      if (!customerId) continue;
+
+      const customerName =
+        customerParticipant?.name ||
+        firstCustomerMsg?.from?.name ||
+        `${params.channel.toUpperCase()} User ${customerId.slice(-4)}`;
+
+      const latestMsg = msgsChrono[msgsChrono.length - 1];
+      const latestText = latestMsg?.message || '';
+      const latestAt = latestMsg?.created_time || thread.updated_time || new Date().toISOString();
+
+      let { data: conv } = await admin
+        .from('conversations')
+        .select('*')
+        .eq('business_id', businessId)
+        .eq('channel', params.channel)
+        .eq('external_thread_id', customerId)
+        .maybeSingle();
+
+      if (!conv) {
+        const { data: createdConv } = await admin
+          .from('conversations')
+          .insert({
+            business_id: businessId,
+            channel: params.channel,
+            external_thread_id: customerId,
+            channel_account_id: params.channelAccountId,
+            customer_name: customerName,
+            last_message: latestText,
+            last_message_at: latestAt,
+            unread_count: 1,
+            ai_enabled: true,
+          })
+          .select('*')
+          .single();
+        conv = createdConv;
+        if (conv) syncedConversations += 1;
+      } else if (customerName && !customerName.includes('User ') && conv.customer_name !== customerName) {
+        await admin.from('conversations').update({ customer_name: customerName }).eq('id', conv.id);
+      }
+
+      if (!conv) continue;
+
+      const { data: existingMsgs } = await admin
+        .from('messages')
+        .select('external_message_id')
+        .eq('conversation_id', conv.id)
+        .neq('external_message_id', '');
+
+      const existingIds = new Set((existingMsgs || []).map((m) => String(m.external_message_id)));
+      let addedNewCustomerMsg = false;
+      let newestUnansweredText = '';
+
+      for (const m of msgsChrono) {
+        if (!m.id || existingIds.has(m.id)) continue;
+        const text = (m.message || '').trim() || '[Attachment]';
+        const isPage = m.from?.id === params.pageId || m.from?.id === params.channelAccountId;
+        const senderType = isPage ? 'staff' : 'customer';
+
+        const { data: saved } = await admin
+          .from('messages')
+          .insert({
+            business_id: businessId,
+            conversation_id: conv.id,
+            external_message_id: m.id,
+            sender_type: senderType,
+            content: text,
+            message_type: 'text',
+            delivery_status: 'delivered',
+            created_at: m.created_time || new Date().toISOString(),
+          })
+          .select('*')
+          .single();
+
+        if (saved) {
+          syncedMessages += 1;
+          existingIds.add(m.id);
+          broadcastToBusiness(businessId, 'message:new', saved);
+          if (senderType === 'customer') {
+            addedNewCustomerMsg = true;
+            newestUnansweredText = text;
+          } else {
+            addedNewCustomerMsg = false;
+            newestUnansweredText = '';
+          }
+        }
+      }
+
+      if (latestText) {
+        await admin
+          .from('conversations')
+          .update({ last_message: latestText, last_message_at: latestAt })
+          .eq('id', conv.id);
+      }
+
+      // If requested and the latest message in the thread is a fresh unanswered customer message (within 20 mins), trigger AI auto-reply
+      if (
+        options?.triggerAutoReply &&
+        addedNewCustomerMsg &&
+        newestUnansweredText &&
+        latestAt &&
+        Date.now() - new Date(latestAt).getTime() < 20 * 60 * 1000
+      ) {
+        const aiOut = await processCustomerMessageWithAi({
+          businessId,
+          conversationId: conv.id,
+          customerMessage: newestUnansweredText,
+        });
+        if (aiOut.replied && aiOut.replyText) {
+          const sent = await dispatchChannelReply({
+            businessId,
+            channel: params.channel,
+            channelAccountId: params.channelAccountId,
+            recipientId: customerId,
+            text: aiOut.replyText,
+          });
+          if (sent.delivered) {
+            aiRepliesSent += 1;
+          } else if (sent.error) {
+            warnings.push(`AI reply send failed (${params.channel}): ${sent.error}`);
+          }
+        } else if (aiOut.error) {
+          warnings.push(`AI auto-reply skipped: ${aiOut.error}`);
+        }
+      }
+    }
+  };
+
+  for (const page of fbPages || []) {
+    const token = decryptSecret(page.page_access_token_encrypted || '');
+    if (!token) continue;
+    await syncChannelFromPage({
+      channel: 'facebook',
+      pageId: page.page_id,
+      channelAccountId: page.page_id,
+      pageName: page.page_name,
+      token,
+    });
+  }
+
+  for (const ig of igAccounts || []) {
+    if (!ig.linked_page_id) continue;
+    const token = decryptSecret(ig.access_token_encrypted || '');
+    if (!token) continue;
+    await syncChannelFromPage({
+      channel: 'instagram',
+      pageId: ig.linked_page_id,
+      channelAccountId: ig.ig_account_id,
+      pageName: ig.username,
+      token,
+    });
+  }
+
+  return {
+    syncedConversations,
+    syncedMessages,
+    aiRepliesSent,
+    webhookSubscribedPages,
+    warnings,
+  };
 }

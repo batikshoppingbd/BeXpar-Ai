@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Bot, Loader2, PauseCircle, PlayCircle, Plus, Search, Send, Sparkles, UserCheck } from 'lucide-react';
+import { Bot, Loader2, PauseCircle, PlayCircle, Plus, RefreshCw, Search, Send, Sparkles, UserCheck } from 'lucide-react';
 import { apiFetch } from '../../lib/api';
 import { getBrowserSupabase } from '../../lib/supabaseClient';
 import type { Business, Conversation, Message } from '../../types';
@@ -18,6 +18,8 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
   const [search, setSearch] = useState('');
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncNotice, setSyncNotice] = useState('');
   const [simOpen, setSimOpen] = useState(false);
   const [simCustomerName, setSimCustomerName] = useState('Karim Ahmed');
   const [simChannel, setSimChannel] = useState<'facebook' | 'instagram' | 'whatsapp' | 'web_test'>('facebook');
@@ -53,8 +55,59 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
     }
   };
 
+  const syncMetaInbox = async (opts?: { triggerAutoReply?: boolean; silent?: boolean }) => {
+    if (!opts?.silent) {
+      setError('');
+      setSyncNotice('');
+    }
+    setSyncing(true);
+    try {
+      const res = await apiFetch<{
+        syncedConversations: number;
+        syncedMessages: number;
+        aiRepliesSent: number;
+        webhookSubscribedPages: number;
+        warnings: string[];
+      }>(`/api/businesses/${business.id}/social/sync-inbox`, {
+        method: 'POST',
+        businessId: business.id,
+        body: JSON.stringify({ triggerAutoReply: opts?.triggerAutoReply !== false }),
+      });
+
+      await loadConversations();
+      if (selected?.id) {
+        await loadMessages(selected.id);
+      }
+
+      if (res.warnings?.length) {
+        setError(res.warnings[0]);
+      } else if (!opts?.silent) {
+        if (res.syncedMessages > 0 || res.aiRepliesSent > 0) {
+          setSyncNotice(
+            lang === 'bn'
+              ? `${res.syncedMessages}টি নতুন মেসেজ সিঙ্ক হয়েছে (${res.aiRepliesSent}টি AI রিপ্লাই পাঠানো হয়েছে)।`
+              : `Synced ${res.syncedMessages} messages and sent ${res.aiRepliesSent} AI auto-replies.`
+          );
+        } else {
+          setSyncNotice(
+            lang === 'bn'
+              ? 'Meta ইনবক্স সিঙ্ক সম্পন্ন হয়েছে — কোনো নতুন অমীমাংসিত মেসেজ নেই।'
+              : 'Meta inbox synced — all connected conversations are up to date.'
+          );
+        }
+      }
+    } catch (err) {
+      if (!opts?.silent) {
+        setError(err instanceof Error ? err.message : 'Failed to sync Meta conversations.');
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   useEffect(() => {
     void loadConversations();
+    void syncMetaInbox({ triggerAutoReply: true, silent: true });
   }, [business.id]);
 
   useEffect(() => {
@@ -63,7 +116,7 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
     }
   }, [selected?.id]);
 
-  // Real-time WebSocket Connection for Live Omnichannel Inbox (with polling fallback on serverless hosts like Vercel)
+  // Real-time WebSocket Connection for Live Omnichannel Inbox (with 5s polling fallback on serverless hosts like Vercel)
   useEffect(() => {
     let ws: WebSocket | null = null;
     let active = true;
@@ -112,7 +165,7 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
       if (selected?.id) {
         void loadMessages(selected.id);
       }
-    }, 10000);
+    }, 5000);
 
     return () => {
       active = false;
@@ -126,15 +179,22 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
     if (mode === 'staff' && !replyText.trim()) return;
     setSending(true);
     setError('');
+    setSyncNotice('');
     try {
-      await apiFetch(`/api/businesses/${business.id}/conversations/${selected.id}/reply`, {
-        method: 'POST',
-        businessId: business.id,
-        body: JSON.stringify({ content: replyText, mode }),
-      });
+      const res = await apiFetch<{ deliveryWarning?: string; error?: string }>(
+        `/api/businesses/${business.id}/conversations/${selected.id}/reply`,
+        {
+          method: 'POST',
+          businessId: business.id,
+          body: JSON.stringify({ content: replyText, mode }),
+        }
+      );
       if (mode === 'staff') setReplyText('');
       await loadMessages(selected.id);
       await loadConversations();
+      if (res.deliveryWarning) {
+        setError(res.deliveryWarning);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reply failed.');
     } finally {
@@ -226,15 +286,32 @@ export const UnifiedInbox: React.FC<UnifiedInboxProps> = ({ business, lang }) =>
             Facebook Messenger · Instagram DM · WhatsApp Business
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setSimOpen((v) => !v)}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#5B35F5] text-white text-xs font-semibold hover:bg-[#4924DE] shadow-sm shadow-[#5B35F5]/20 transition-all"
-        >
-          <Plus className="w-4 h-4" />
-          <span>{lang === 'bn' ? 'লাইভ AI টেস্ট মেসেজ' : 'Test Customer Message'}</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={syncing}
+            onClick={() => void syncMetaInbox({ triggerAutoReply: true, silent: false })}
+            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F3F0FF] dark:bg-slate-800 text-[#5B35F5] dark:text-[#A78BFA] text-xs font-semibold hover:bg-[#E6E0FF]/70 disabled:opacity-60 transition-all"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
+            <span>{syncing ? (lang === 'bn' ? 'সিঙ্ক হচ্ছে...' : 'Syncing...') : lang === 'bn' ? 'মেসেঞ্জার সিঙ্ক' : 'Sync Meta Chats'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSimOpen((v) => !v)}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#5B35F5] text-white text-xs font-semibold hover:bg-[#4924DE] shadow-sm shadow-[#5B35F5]/20 transition-all"
+          >
+            <Plus className="w-4 h-4" />
+            <span>{lang === 'bn' ? 'লাইভ AI টেস্ট মেসেজ' : 'Test Customer Message'}</span>
+          </button>
+        </div>
       </div>
+
+      {syncNotice && (
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30 p-3 text-xs text-emerald-700 dark:text-emerald-300">
+          {syncNotice}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-xl border border-red-200 bg-red-50 dark:bg-red-950/30 p-3 text-xs text-red-700 dark:text-red-300">

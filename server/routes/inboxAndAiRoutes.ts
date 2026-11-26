@@ -266,17 +266,23 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
         });
       }
 
+      let deliveryWarning: string | undefined;
+      let channelDelivered = true;
       if (conv.channel !== 'web_test' && aiOutcome.replyText) {
-        await dispatchChannelReply({
+        const dispatch = await dispatchChannelReply({
           businessId,
           channel: conv.channel,
           channelAccountId: conv.channel_account_id || '',
           recipientId: conv.external_thread_id,
           text: aiOutcome.replyText,
         });
+        channelDelivered = dispatch.delivered;
+        if (!dispatch.delivered) {
+          deliveryWarning = dispatch.error || `Failed to send AI reply to ${conv.channel}.`;
+        }
       }
 
-      return res.json(aiOutcome);
+      return res.json({ ...aiOutcome, channelDelivered, deliveryWarning });
     }
 
     if (!content?.trim() && !attachmentUrl) {
