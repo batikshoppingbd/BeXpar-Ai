@@ -57,8 +57,8 @@ INSERT INTO ai_models (provider_id, model_id, display_name, is_active, is_defaul
 SELECT p.id, m.model_id, m.display_name, m.is_active, m.is_default, m.is_fallback, m.priority, m.in_cost, m.out_cost, 1000, m.max_tok, 'free'
 FROM ai_providers p
 JOIN (VALUES
-  ('gemini', 'gemini-2.5-flash', 'Gemini 2.5 Flash (Fast & Bilingual)', TRUE, TRUE, FALSE, 1, 0.15, 0.60, 2048),
-  ('gemini', 'gemini-2.5-pro', 'Gemini 2.5 Pro (Advanced Reasoning)', TRUE, FALSE, TRUE, 2, 1.25, 5.00, 4096),
+  ('gemini', 'gemini-3.8-flash', 'Gemini 3.8 Flash (Fast & Free-Tier)', TRUE, TRUE, FALSE, 1, 0.15, 0.60, 2048),
+  ('gemini', 'gemini-4-hydrogen', 'Gemini 4 Hydrogen (Bilingual Sales)', TRUE, FALSE, TRUE, 2, 0.15, 0.60, 2048),
   ('openai', 'gpt-4o-mini', 'GPT-4o Mini', TRUE, FALSE, FALSE, 3, 0.15, 0.60, 2048),
   ('deepseek', 'deepseek-chat', 'DeepSeek V3 Chat', TRUE, FALSE, FALSE, 4, 0.27, 1.10, 2048)
 ) AS m(pslug, model_id, display_name, is_active, is_default, is_fallback, priority, in_cost, out_cost, max_tok)

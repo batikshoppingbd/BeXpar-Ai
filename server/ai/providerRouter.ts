@@ -72,8 +72,8 @@ const DEFAULT_MODEL_BY_TYPE: Record<
 > = {
   gemini: [
     {
-      model_id: 'gemini-2.5-flash',
-      display_name: 'Gemini 2.5 Flash (Fast & Bilingual)',
+      model_id: 'gemini-3.8-flash',
+      display_name: 'Gemini 3.8 Flash (Fast & Free-Tier)',
       is_default: true,
       is_fallback: false,
       priority: 1,
@@ -82,14 +82,24 @@ const DEFAULT_MODEL_BY_TYPE: Record<
       max_tokens: 2048,
     },
     {
-      model_id: 'gemini-2.5-pro',
-      display_name: 'Gemini 2.5 Pro (Advanced Reasoning)',
+      model_id: 'gemini-4-hydrogen',
+      display_name: 'Gemini 4 Hydrogen (Bilingual Sales)',
       is_default: false,
       is_fallback: true,
       priority: 2,
-      input_cost_per_1m: 1.25,
-      output_cost_per_1m: 5.0,
-      max_tokens: 4096,
+      input_cost_per_1m: 0.15,
+      output_cost_per_1m: 0.6,
+      max_tokens: 2048,
+    },
+    {
+      model_id: 'gemini-3.1-flash-lite',
+      display_name: 'Gemini 3.1 Flash Lite (Economy)',
+      is_default: false,
+      is_fallback: true,
+      priority: 3,
+      input_cost_per_1m: 0.08,
+      output_cost_per_1m: 0.3,
+      max_tokens: 2048,
     },
   ],
   openai: [
@@ -161,43 +171,77 @@ export async function ensureDefaultAiProvidersAndModels(): Promise<void> {
       await admin.from('ai_models').upsert(toInsert, { onConflict: 'provider_id,model_id', ignoreDuplicates: true });
     }
   } else {
-    // If Gemini provider exists and only has legacy gemini-4-* model IDs, ensure gemini-2.5-flash exists
+    // Auto-migrate retired Gemini models (1.5 / 2.0 / 2.5) to active models (gemini-3.8-flash / gemini-4-hydrogen)
+    const retiredGeminiIds = new Set([
+      'gemini-2.5-flash',
+      'gemini-2.5-pro',
+      'gemini-2.0-flash',
+      'gemini-2.0-pro',
+      'gemini-2.0-flash-thinking',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
+      'gemini-pro',
+    ]);
     const geminiProv = providers.find((p) => p.provider_type === 'gemini');
     if (geminiProv) {
       const geminiModels = models.filter((m) => m.provider_id === geminiProv.id);
-      const onlyLegacy =
-        geminiModels.length > 0 && geminiModels.every((m) => String(m.model_id).startsWith('gemini-4-'));
-      if (geminiModels.length === 0 || onlyLegacy) {
-        const flashTpl = DEFAULT_MODEL_BY_TYPE.gemini[0];
-        await admin.from('ai_models').upsert(
-          {
-            provider_id: geminiProv.id,
-            model_id: flashTpl.model_id,
-            display_name: flashTpl.display_name,
-            is_active: true,
-            is_default: !hasAnyDefault || onlyLegacy,
-            is_fallback: false,
-            priority: 1,
-            input_cost_per_1m: flashTpl.input_cost_per_1m,
-            output_cost_per_1m: flashTpl.output_cost_per_1m,
-            coins_per_usd: 1000,
-            max_tokens: flashTpl.max_tokens,
-            min_plan_slug: 'free',
-          },
-          { onConflict: 'provider_id,model_id', ignoreDuplicates: true }
-        );
-        if (onlyLegacy) {
-          await admin
-            .from('ai_models')
-            .update({ is_default: false })
-            .eq('provider_id', geminiProv.id)
-            .neq('model_id', 'gemini-2.5-flash');
-          await admin
-            .from('ai_models')
-            .update({ is_default: true })
-            .eq('provider_id', geminiProv.id)
-            .eq('model_id', 'gemini-2.5-flash');
+      const onlyRetiredOrEmpty =
+        geminiModels.length === 0 || geminiModels.every((m) => retiredGeminiIds.has(String(m.model_id)));
+      const hasRetiredDefault = geminiModels.some(
+        (m) => m.is_default && retiredGeminiIds.has(String(m.model_id))
+      );
+
+      if (onlyRetiredOrEmpty || hasRetiredDefault) {
+        const primaryTpl = DEFAULT_MODEL_BY_TYPE.gemini[0];
+        const fallbackTpl = DEFAULT_MODEL_BY_TYPE.gemini[1];
+
+        for (const retiredId of retiredGeminiIds) {
+          if (geminiModels.some((m) => String(m.model_id) === retiredId)) {
+            await admin
+              .from('ai_models')
+              .update({ is_active: false, is_default: false, is_fallback: false })
+              .eq('provider_id', geminiProv.id)
+              .eq('model_id', retiredId);
+          }
         }
+
+        const anyOtherDefault = models.some(
+          (m) => m.is_default && m.provider_id !== geminiProv.id
+        );
+
+        await admin.from('ai_models').upsert(
+          [
+            {
+              provider_id: geminiProv.id,
+              model_id: primaryTpl.model_id,
+              display_name: primaryTpl.display_name,
+              is_active: true,
+              is_default: !anyOtherDefault || hasRetiredDefault || !hasAnyDefault,
+              is_fallback: false,
+              priority: primaryTpl.priority,
+              input_cost_per_1m: primaryTpl.input_cost_per_1m,
+              output_cost_per_1m: primaryTpl.output_cost_per_1m,
+              coins_per_usd: 1000,
+              max_tokens: primaryTpl.max_tokens,
+              min_plan_slug: 'free',
+            },
+            {
+              provider_id: geminiProv.id,
+              model_id: fallbackTpl.model_id,
+              display_name: fallbackTpl.display_name,
+              is_active: true,
+              is_default: false,
+              is_fallback: true,
+              priority: fallbackTpl.priority,
+              input_cost_per_1m: fallbackTpl.input_cost_per_1m,
+              output_cost_per_1m: fallbackTpl.output_cost_per_1m,
+              coins_per_usd: 1000,
+              max_tokens: fallbackTpl.max_tokens,
+              min_plan_slug: 'free',
+            },
+          ],
+          { onConflict: 'provider_id,model_id' }
+        );
       }
     }
   }
@@ -288,7 +332,14 @@ async function callSingleModel(
   let outputTokens = 0;
 
   if (model.provider.provider_type === 'gemini') {
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
 
     const runGemini = async (withSchema: boolean) =>
       ai.models.generateContent({
@@ -502,61 +553,89 @@ export async function testProviderConnection(
     .limit(5);
 
   const pType = provider.provider_type as 'gemini' | 'openai' | 'deepseek' | 'custom';
-  const fallbackModelId =
-    pType === 'gemini' ? 'gemini-2.5-flash' : pType === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini';
+  const defaultCandidates =
+    pType === 'gemini'
+      ? ['gemini-3.8-flash', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+      : pType === 'deepseek'
+      ? ['deepseek-chat']
+      : ['gpt-4o-mini'];
 
-  const pickedModel =
-    (providerModels || []).find((m) => !String(m.model_id).startsWith('gemini-4-')) ||
-    (providerModels || [])[0];
+  const retiredGemini = new Set([
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash',
+    'gemini-2.0-pro',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+  ]);
 
-  const modelId = overrides?.modelId?.trim() || pickedModel?.model_id || fallbackModelId;
+  const dbActiveIds = (providerModels || [])
+    .map((m) => String(m.model_id))
+    .filter((id) => pType !== 'gemini' || !retiredGemini.has(id));
 
-  const syntheticModel: AiModelConfig = {
-    id: pickedModel?.id || provider.id,
-    provider_id: provider.id,
-    model_id: modelId,
-    display_name: pickedModel?.display_name || modelId,
-    is_active: true,
-    is_default: true,
-    is_fallback: false,
-    priority: 1,
-    input_cost_per_1m: Number(pickedModel?.input_cost_per_1m ?? 0.15),
-    output_cost_per_1m: Number(pickedModel?.output_cost_per_1m ?? 0.6),
-    coins_per_usd: Number(pickedModel?.coins_per_usd ?? 1000),
-    max_tokens: Number(pickedModel?.max_tokens ?? 256),
-    min_plan_slug: 'free',
-    provider: {
-      id: provider.id,
-      slug: provider.slug,
-      name: provider.name,
-      provider_type: pType,
-      base_url: provider.base_url || '',
-      api_key_encrypted: provider.api_key_encrypted || '',
-      is_active: true,
-    },
-  };
+  const candidateIds = overrides?.modelId?.trim()
+    ? [overrides.modelId.trim()]
+    : Array.from(new Set([...dbActiveIds, ...defaultCandidates]));
 
+  const pickedModel = (providerModels || [])[0];
+  let lastError = 'Connection test failed.';
+  let lastModelId = candidateIds[0] || defaultCandidates[0];
   const start = Date.now();
-  try {
-    const result = await callSingleModel(syntheticModel, {
-      systemInstruction: 'Reply concisely with OK.',
-      prompt: 'Health check ping. Reply with OK.',
-      expectJson: false,
-      overrideApiKey: overrides?.apiKey,
-      overrideBaseUrl: overrides?.baseUrl,
-    });
-    return {
-      ok: true,
-      latencyMs: Date.now() - start,
-      modelId,
-      sample: result.text.slice(0, 120),
+
+  for (const modelId of candidateIds) {
+    lastModelId = modelId;
+    const syntheticModel: AiModelConfig = {
+      id: pickedModel?.id || provider.id,
+      provider_id: provider.id,
+      model_id: modelId,
+      display_name: pickedModel?.display_name || modelId,
+      is_active: true,
+      is_default: true,
+      is_fallback: false,
+      priority: 1,
+      input_cost_per_1m: Number(pickedModel?.input_cost_per_1m ?? 0.15),
+      output_cost_per_1m: Number(pickedModel?.output_cost_per_1m ?? 0.6),
+      coins_per_usd: Number(pickedModel?.coins_per_usd ?? 1000),
+      max_tokens: Number(pickedModel?.max_tokens ?? 256),
+      min_plan_slug: 'free',
+      provider: {
+        id: provider.id,
+        slug: provider.slug,
+        name: provider.name,
+        provider_type: pType,
+        base_url: provider.base_url || '',
+        api_key_encrypted: provider.api_key_encrypted || '',
+        is_active: true,
+      },
     };
-  } catch (err) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - start,
-      modelId,
-      error: err instanceof Error ? err.message : String(err),
-    };
+
+    try {
+      const result = await callSingleModel(syntheticModel, {
+        systemInstruction: 'Reply concisely with OK.',
+        prompt: 'Health check ping. Reply with OK.',
+        expectJson: false,
+        overrideApiKey: overrides?.apiKey,
+        overrideBaseUrl: overrides?.baseUrl,
+      });
+      return {
+        ok: true,
+        latencyMs: Date.now() - start,
+        modelId,
+        sample: result.text.slice(0, 120),
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      const isModelNotFound = /404|NOT_FOUND|no longer available/i.test(lastError);
+      if (!isModelNotFound) {
+        break;
+      }
+    }
   }
+
+  return {
+    ok: false,
+    latencyMs: Date.now() - start,
+    modelId: lastModelId,
+    error: lastError,
+  };
 }

@@ -390,7 +390,7 @@ export const AiProvidersView: React.FC<{
           <input
             type="text"
             required
-            placeholder="Model ID (e.g. gemini-2.5-flash)"
+            placeholder="Model ID (e.g. gemini-3.8-flash)"
             value={newModel.model_id}
             onChange={(e) => setNewModel({ ...newModel, model_id: e.target.value })}
             className="px-3 py-2 rounded-xl border border-[#E6E0FF] dark:border-slate-700 bg-[#F8F9FC] dark:bg-slate-950 font-mono"
