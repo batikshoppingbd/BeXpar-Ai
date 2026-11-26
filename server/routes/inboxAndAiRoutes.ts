@@ -171,15 +171,47 @@ router.get('/businesses/:businessId/conversations/:conversationId/messages', req
 
     if (error) return res.status(400).json({ error: error.message });
 
-    await admin
-      .from('conversations')
-      .update({ unread_count: 0 })
-      .eq('id', req.params.conversationId)
-      .eq('business_id', req.businessId!);
+    await Promise.all([
+      admin
+        .from('conversations')
+        .update({ unread_count: 0 })
+        .eq('id', req.params.conversationId)
+        .eq('business_id', req.businessId!),
+      admin
+        .from('messages')
+        .update({ delivery_status: 'read' })
+        .eq('conversation_id', req.params.conversationId)
+        .eq('business_id', req.businessId!)
+        .eq('sender_type', 'customer')
+        .neq('delivery_status', 'read'),
+    ]);
 
     return res.json({ messages: data || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load messages.' });
+  }
+});
+
+router.post('/businesses/:businessId/conversations/:conversationId/read', requireAuth, requireBusinessAccess('inbox'), async (req: AuthedRequest, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    await Promise.all([
+      admin
+        .from('conversations')
+        .update({ unread_count: 0 })
+        .eq('id', req.params.conversationId)
+        .eq('business_id', req.businessId!),
+      admin
+        .from('messages')
+        .update({ delivery_status: 'read' })
+        .eq('conversation_id', req.params.conversationId)
+        .eq('business_id', req.businessId!)
+        .eq('sender_type', 'customer')
+        .neq('delivery_status', 'read'),
+    ]);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to mark conversation read.' });
   }
 });
 
@@ -227,11 +259,27 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
     const admin = getSupabaseAdmin();
     const businessId = req.businessId!;
     const conversationId = req.params.conversationId;
-    const { content, mode, attachmentUrl } = req.body as {
+    const { content, mode, attachmentUrl, attachmentType, attachmentName, attachmentSize } = req.body as {
       content?: string;
       mode?: 'staff' | 'ai';
       attachmentUrl?: string;
+      attachmentType?: 'image' | 'file';
+      attachmentName?: string;
+      attachmentSize?: number;
     };
+
+    let safeAttachmentUrl = '';
+    if (attachmentUrl) {
+      try {
+        const parsed = new URL(attachmentUrl.trim());
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+          return res.status(400).json({ error: 'Invalid attachment URL protocol.' });
+        }
+        safeAttachmentUrl = parsed.toString();
+      } catch {
+        return res.status(400).json({ error: 'Invalid attachment URL.' });
+      }
+    }
 
     const { data: conv } = await admin
       .from('conversations')
@@ -277,6 +325,24 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
           text: aiOutcome.replyText,
         });
         channelDelivered = dispatch.delivered;
+        if (aiOutcome.messageId) {
+          if (dispatch.delivered && dispatch.externalMessageId) {
+            await admin
+              .from('messages')
+              .update({ external_message_id: dispatch.externalMessageId })
+              .eq('id', aiOutcome.messageId);
+          } else if (!dispatch.delivered) {
+            await admin
+              .from('messages')
+              .update({ delivery_status: 'failed' })
+              .eq('id', aiOutcome.messageId);
+            broadcastToBusiness(businessId, 'message:status', {
+              conversationId,
+              messageId: aiOutcome.messageId,
+              status: 'failed',
+            });
+          }
+        }
         if (!dispatch.delivered) {
           deliveryWarning = dispatch.error || `Failed to send AI reply to ${conv.channel}.`;
         }
@@ -285,26 +351,39 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
       return res.json({ ...aiOutcome, channelDelivered, deliveryWarning });
     }
 
-    if (!content?.trim() && !attachmentUrl) {
-      return res.status(400).json({ error: 'Message content is required.' });
+    const cleanContent = content?.trim() || '';
+    if (!cleanContent && !safeAttachmentUrl) {
+      return res.status(400).json({ error: 'Message content or attachment is required.' });
     }
 
-    let deliveryStatus = 'sent';
+    let deliveryStatus: 'sent' | 'delivered' | 'failed' = conv.channel === 'web_test' ? 'delivered' : 'sent';
     let externalMsgId = '';
-    if (conv.channel !== 'web_test' && content?.trim()) {
+    let deliveryWarning: string | undefined;
+    const normalizedAttachmentType: 'image' | 'file' = attachmentType === 'file' ? 'file' : 'image';
+
+    if (conv.channel !== 'web_test') {
       const dispatch = await dispatchChannelReply({
         businessId,
         channel: conv.channel,
         channelAccountId: conv.channel_account_id || '',
         recipientId: conv.external_thread_id,
-        text: content.trim(),
+        text: cleanContent,
+        attachmentUrl: safeAttachmentUrl || undefined,
+        attachmentType: safeAttachmentUrl ? normalizedAttachmentType : undefined,
       });
       if (!dispatch.delivered) {
         deliveryStatus = 'failed';
+        deliveryWarning = dispatch.error || `Failed to send to ${conv.channel}.`;
       } else if (dispatch.externalMessageId) {
         externalMsgId = dispatch.externalMessageId;
       }
     }
+
+    const msgType = safeAttachmentUrl
+      ? normalizedAttachmentType === 'file'
+        ? 'attachment'
+        : 'image'
+      : 'text';
 
     const { data: msg, error } = await admin
       .from('messages')
@@ -314,8 +393,8 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
         external_message_id: externalMsgId,
         sender_type: 'staff',
         sender_id: req.user!.id,
-        content: content?.trim() || '',
-        message_type: attachmentUrl ? 'image' : 'text',
+        content: cleanContent,
+        message_type: msgType,
         delivery_status: deliveryStatus,
       })
       .select('*')
@@ -323,25 +402,40 @@ router.post('/businesses/:businessId/conversations/:conversationId/reply', requi
 
     if (error) return res.status(400).json({ error: error.message });
 
-    if (attachmentUrl) {
+    if (safeAttachmentUrl) {
       await admin.from('message_attachments').insert({
         business_id: businessId,
         message_id: msg.id,
-        file_url: attachmentUrl,
-        file_type: 'image',
+        file_url: safeAttachmentUrl,
+        file_type: normalizedAttachmentType,
+        file_name: (attachmentName || '').slice(0, 180),
+        file_size: Number(attachmentSize || 0),
       });
     }
 
-    await admin
+    const { data: fullMsg } = await admin
+      .from('messages')
+      .select('*, attachments:message_attachments(*)')
+      .eq('id', msg.id)
+      .single();
+
+    const lastMsgSummary = cleanContent || (normalizedAttachmentType === 'file' ? '📎 File attachment' : '📷 Photo');
+    const { data: updatedConv } = await admin
       .from('conversations')
       .update({
-        last_message: content?.trim() || '[Attachment]',
+        last_message: lastMsgSummary,
         last_message_at: new Date().toISOString(),
+        unread_count: 0,
       })
-      .eq('id', conversationId);
+      .eq('id', conversationId)
+      .select('*, customer:customers(*)')
+      .single();
 
-    broadcastToBusiness(businessId, 'message:new', msg);
-    return res.status(201).json({ message: msg });
+    if (updatedConv) {
+      broadcastToBusiness(businessId, 'conversation:updated', updatedConv);
+    }
+    broadcastToBusiness(businessId, 'message:new', fullMsg || msg);
+    return res.status(201).json({ message: fullMsg || msg, deliveryWarning });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to send reply.' });
   }

@@ -192,6 +192,7 @@ export interface Conversation {
   customer_id?: string;
   channel: 'facebook' | 'instagram' | 'whatsapp' | 'web_test';
   external_thread_id: string;
+  channel_account_id?: string;
   customer_name: string;
   customer_avatar?: string;
   last_message: string;
@@ -214,6 +215,6 @@ export interface Message {
   message_type: 'text' | 'image' | 'attachment' | 'order_summary';
   delivery_status: 'sent' | 'delivered' | 'read' | 'failed';
   metadata?: Record<string, unknown>;
-  attachments?: Array<{ id: string; file_url: string; file_type: string }>;
+  attachments?: Array<{ id: string; file_url: string; file_type: string; file_name?: string; file_size?: number }>;
   created_at: string;
 }

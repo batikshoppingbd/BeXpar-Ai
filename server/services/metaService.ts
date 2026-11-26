@@ -717,15 +717,36 @@ export async function sendMetaCapiEvent(params: {
   }
 }
 
+function sanitizeSafeHttpUrl(raw?: string): string {
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw.trim());
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch {
+    // invalid url
+  }
+  return '';
+}
+
 export async function dispatchChannelReply(params: {
   businessId: string;
   channel: 'facebook' | 'instagram' | 'whatsapp' | 'web_test';
   channelAccountId: string;
   recipientId: string;
-  text: string;
+  text?: string;
+  attachmentUrl?: string;
+  attachmentType?: 'image' | 'file';
 }): Promise<{ delivered: boolean; externalMessageId?: string; error?: string }> {
   if (params.channel === 'web_test') {
     return { delivered: true };
+  }
+
+  const cleanText = (params.text || '').trim();
+  const safeAttachmentUrl = sanitizeSafeHttpUrl(params.attachmentUrl);
+  if (!cleanText && !safeAttachmentUrl) {
+    return { delivered: false, error: 'Message text or valid attachment URL is required.' };
   }
 
   const metaCfg = await getPlatformMetaConfig();
@@ -738,21 +759,48 @@ export async function dispatchChannelReply(params: {
     });
     if (!token) return { delivered: false, error: 'No active Meta Page/IG access token.' };
 
-    const res = await fetch(
-      `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`,
-      {
+    const endpoint = `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`;
+    let lastMsgId: string | undefined;
+
+    if (safeAttachmentUrl) {
+      const attType = params.attachmentType === 'file' ? 'file' : 'image';
+      const attRes = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messaging_type: 'RESPONSE',
           recipient: { id: params.recipientId },
-          message: { text: params.text },
+          message: {
+            attachment: {
+              type: attType,
+              payload: { url: safeAttachmentUrl, is_reusable: true },
+            },
+          },
         }),
+      });
+      const attJson = (await attRes.json()) as { message_id?: string; error?: { message?: string } };
+      if (!attRes.ok) {
+        return { delivered: false, error: attJson.error?.message || `Meta attachment send error (${attRes.status})` };
       }
-    );
-    const json = (await res.json()) as { message_id?: string; error?: { message?: string } };
-    if (!res.ok) return { delivered: false, error: json.error?.message || `Meta Send API error (${res.status})` };
-    return { delivered: true, externalMessageId: json.message_id };
+      lastMsgId = attJson.message_id;
+    }
+
+    if (cleanText) {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messaging_type: 'RESPONSE',
+          recipient: { id: params.recipientId },
+          message: { text: cleanText },
+        }),
+      });
+      const json = (await res.json()) as { message_id?: string; error?: { message?: string } };
+      if (!res.ok) return { delivered: false, error: json.error?.message || `Meta Send API error (${res.status})` };
+      lastMsgId = json.message_id || lastMsgId;
+    }
+
+    return { delivered: true, externalMessageId: lastMsgId };
   }
 
   if (params.channel === 'whatsapp') {
@@ -764,18 +812,34 @@ export async function dispatchChannelReply(params: {
     const phoneId = params.channelAccountId || accountId;
     if (!token || !phoneId) return { delivered: false, error: 'No active WhatsApp Business token.' };
 
+    const waPayload = safeAttachmentUrl
+      ? params.attachmentType === 'file'
+        ? {
+            messaging_product: 'whatsapp',
+            to: params.recipientId,
+            type: 'document',
+            document: { link: safeAttachmentUrl, ...(cleanText ? { caption: cleanText } : {}) },
+          }
+        : {
+            messaging_product: 'whatsapp',
+            to: params.recipientId,
+            type: 'image',
+            image: { link: safeAttachmentUrl, ...(cleanText ? { caption: cleanText } : {}) },
+          }
+      : {
+          messaging_product: 'whatsapp',
+          to: params.recipientId,
+          type: 'text',
+          text: { body: cleanText },
+        };
+
     const res = await fetch(`https://graph.facebook.com/${metaCfg.apiVersion}/${phoneId}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: params.recipientId,
-        type: 'text',
-        text: { body: params.text },
-      }),
+      body: JSON.stringify(waPayload),
     });
     const json = (await res.json()) as { messages?: Array<{ id: string }>; error?: { message?: string } };
     if (!res.ok) return { delivered: false, error: json.error?.message || `WhatsApp Cloud API error (${res.status})` };
@@ -846,7 +910,7 @@ export async function syncMetaConversationsForBusiness(
     }
 
     const platformQuery = params.channel === 'instagram' ? '&platform=instagram' : '';
-    const convUrl = `https://graph.facebook.com/${metaCfg.apiVersion}/${params.pageId}/conversations?fields=id,updated_time,participants,messages.limit(10){id,message,from,to,created_time}${platformQuery}&limit=15&access_token=${encodeURIComponent(params.token)}`;
+    const convUrl = `https://graph.facebook.com/${metaCfg.apiVersion}/${params.pageId}/conversations?fields=id,updated_time,participants,messages.limit(15){id,message,from,to,created_time,attachments}&${platformQuery ? platformQuery.slice(1) + '&' : ''}limit=15&access_token=${encodeURIComponent(params.token)}`;
 
     const res = await fetch(convUrl);
     const json = (await res.json()) as {
@@ -860,6 +924,17 @@ export async function syncMetaConversationsForBusiness(
             message?: string;
             from?: { id: string; name?: string };
             created_time?: string;
+            attachments?: {
+              data?: Array<{
+                id?: string;
+                mime_type?: string;
+                name?: string;
+                size?: number;
+                file_url?: string;
+                image_data?: { url?: string; preview_url?: string };
+                video_data?: { url?: string };
+              }>;
+            };
           }>;
         };
       }>;
@@ -883,13 +958,20 @@ export async function syncMetaConversationsForBusiness(
       const customerId = customerParticipant?.id || firstCustomerMsg?.from?.id;
       if (!customerId) continue;
 
-      const customerName =
+      let customerName =
         customerParticipant?.name ||
         firstCustomerMsg?.from?.name ||
         `${params.channel.toUpperCase()} User ${customerId.slice(-4)}`;
 
       const latestMsg = msgsChrono[msgsChrono.length - 1];
-      const latestText = latestMsg?.message || '';
+      const latestHasAttachments = Boolean(latestMsg?.attachments?.data?.length);
+      const latestText =
+        latestMsg?.message?.trim() ||
+        (latestHasAttachments
+          ? latestMsg?.attachments?.data?.[0]?.image_data
+            ? '📷 Photo'
+            : '📎 Attachment'
+          : '');
       const latestAt = latestMsg?.created_time || thread.updated_time || new Date().toISOString();
 
       let { data: conv } = await admin
@@ -900,6 +982,17 @@ export async function syncMetaConversationsForBusiness(
         .eq('external_thread_id', customerId)
         .maybeSingle();
 
+      let customerAvatar = conv?.customer_avatar || '';
+      if (!conv || !customerAvatar || customerName.startsWith(`${params.channel.toUpperCase()} User `)) {
+        const prof = await fetchMetaSenderProfile({
+          senderId: customerId,
+          accessToken: params.token,
+          apiVersion: metaCfg.apiVersion,
+        });
+        if (prof.name) customerName = prof.name;
+        if (prof.avatar) customerAvatar = prof.avatar;
+      }
+
       if (!conv) {
         const { data: createdConv } = await admin
           .from('conversations')
@@ -909,6 +1002,7 @@ export async function syncMetaConversationsForBusiness(
             external_thread_id: customerId,
             channel_account_id: params.channelAccountId,
             customer_name: customerName,
+            customer_avatar: customerAvatar,
             last_message: latestText,
             last_message_at: latestAt,
             unread_count: 1,
@@ -918,8 +1012,17 @@ export async function syncMetaConversationsForBusiness(
           .single();
         conv = createdConv;
         if (conv) syncedConversations += 1;
-      } else if (customerName && !customerName.includes('User ') && conv.customer_name !== customerName) {
-        await admin.from('conversations').update({ customer_name: customerName }).eq('id', conv.id);
+      } else if (
+        (customerName && !customerName.includes('User ') && conv.customer_name !== customerName) ||
+        (customerAvatar && conv.customer_avatar !== customerAvatar)
+      ) {
+        await admin
+          .from('conversations')
+          .update({
+            ...(customerName && !customerName.includes('User ') ? { customer_name: customerName } : {}),
+            ...(customerAvatar ? { customer_avatar: customerAvatar } : {}),
+          })
+          .eq('id', conv.id);
       }
 
       if (!conv) continue;
@@ -936,9 +1039,27 @@ export async function syncMetaConversationsForBusiness(
 
       for (const m of msgsChrono) {
         if (!m.id || existingIds.has(m.id)) continue;
-        const text = (m.message || '').trim() || '[Attachment]';
+        const rawAtts = m.attachments?.data || [];
+        const parsedAtts = rawAtts
+          .map((att) => {
+            const url = att.image_data?.url || att.image_data?.preview_url || att.file_url || att.video_data?.url || '';
+            const safeUrl = sanitizeSafeHttpUrl(url);
+            if (!safeUrl) return null;
+            const isImg = Boolean(att.image_data?.url || att.image_data?.preview_url || att.mime_type?.startsWith('image/'));
+            return {
+              file_url: safeUrl,
+              file_type: isImg ? 'image' : 'file',
+              file_name: att.name || '',
+              file_size: Number(att.size || 0),
+            };
+          })
+          .filter((v): v is { file_url: string; file_type: string; file_name: string; file_size: number } => Boolean(v));
+
+        const text = (m.message || '').trim() || (parsedAtts.length ? '' : '[Attachment]');
         const isPage = m.from?.id === params.pageId || m.from?.id === params.channelAccountId;
         const senderType = isPage ? 'staff' : 'customer';
+        const hasImg = parsedAtts.some((a) => a.file_type === 'image');
+        const msgType = hasImg ? 'image' : parsedAtts.length > 0 ? 'attachment' : 'text';
 
         const { data: saved } = await admin
           .from('messages')
@@ -948,7 +1069,7 @@ export async function syncMetaConversationsForBusiness(
             external_message_id: m.id,
             sender_type: senderType,
             content: text,
-            message_type: 'text',
+            message_type: msgType,
             delivery_status: 'delivered',
             created_at: m.created_time || new Date().toISOString(),
           })
@@ -956,12 +1077,27 @@ export async function syncMetaConversationsForBusiness(
           .single();
 
         if (saved) {
+          if (parsedAtts.length > 0) {
+            await admin.from('message_attachments').insert(
+              parsedAtts.map((a) => ({
+                business_id: businessId,
+                message_id: saved.id,
+                ...a,
+              }))
+            );
+          }
+          const { data: fullSaved } = await admin
+            .from('messages')
+            .select('*, attachments:message_attachments(*)')
+            .eq('id', saved.id)
+            .single();
+
           syncedMessages += 1;
           existingIds.add(m.id);
-          broadcastToBusiness(businessId, 'message:new', saved);
+          broadcastToBusiness(businessId, 'message:new', fullSaved || saved);
           if (senderType === 'customer') {
             addedNewCustomerMsg = true;
-            newestUnansweredText = text;
+            newestUnansweredText = text || (hasImg ? 'Customer sent an image.' : 'Customer sent an attachment.');
           } else {
             addedNewCustomerMsg = false;
             newestUnansweredText = '';
@@ -997,6 +1133,19 @@ export async function syncMetaConversationsForBusiness(
             recipientId: customerId,
             text: aiOut.replyText,
           });
+          if (aiOut.messageId) {
+            if (sent.delivered && sent.externalMessageId) {
+              await admin
+                .from('messages')
+                .update({ external_message_id: sent.externalMessageId })
+                .eq('id', aiOut.messageId);
+            } else if (!sent.delivered) {
+              await admin
+                .from('messages')
+                .update({ delivery_status: 'failed' })
+                .eq('id', aiOut.messageId);
+            }
+          }
           if (sent.delivered) {
             aiRepliesSent += 1;
           } else if (sent.error) {

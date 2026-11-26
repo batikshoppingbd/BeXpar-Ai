@@ -30,6 +30,7 @@ export async function processCustomerMessageWithAi(params: {
   userId?: string | null;
 }): Promise<{
   replied: boolean;
+  messageId?: string;
   replyText?: string;
   orderCreatedId?: string;
   error?: string;
@@ -439,6 +440,7 @@ RETURN STRICT JSON ONLY matching this schema:
 
   return {
     replied: true,
+    messageId: savedAiMsg?.id,
     replyText: parsed.reply_text,
     orderCreatedId,
   };

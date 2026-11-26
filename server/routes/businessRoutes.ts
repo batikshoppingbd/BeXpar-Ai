@@ -223,12 +223,18 @@ router.post('/businesses/:businessId/upload', requireAuth, requireBusinessAccess
       return res.status(400).json({ error: 'File exceeds 8MB upload limit.' });
     }
 
+    const blockedMimePrefixes = ['text/html', 'application/javascript', 'text/javascript', 'image/svg+xml'];
+    const normalizedType = (contentType || 'application/octet-stream').toLowerCase();
+    if (blockedMimePrefixes.some((b) => normalizedType.includes(b))) {
+      return res.status(400).json({ error: 'Unsupported or unsafe file type.' });
+    }
+
     const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storagePath = `${req.businessId}/${Date.now()}_${safeName}`;
     const admin = getSupabaseAdmin();
 
     const { error } = await admin.storage.from(targetBucket).upload(storagePath, buffer, {
-      contentType: contentType || 'application/octet-stream',
+      contentType: normalizedType,
       upsert: false,
     });
 

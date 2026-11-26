@@ -267,11 +267,13 @@ router.post('/webhooks/meta', async (req, res) => {
           sender?: { id?: string };
           recipient?: { id?: string };
           timestamp?: number;
+          delivery?: { mids?: string[]; watermark?: number };
+          read?: { watermark?: number };
           message?: {
             mid?: string;
             text?: string;
             is_echo?: boolean;
-            attachments?: Array<{ type?: string }>;
+            attachments?: Array<{ type?: string; payload?: { url?: string } }>;
           };
           postback?: { mid?: string; title?: string; payload?: string };
         }>;
@@ -281,6 +283,7 @@ router.post('/webhooks/meta', async (req, res) => {
             metadata?: { phone_number_id?: string };
             contacts?: Array<{ profile?: { name?: string }; wa_id?: string }>;
             messages?: Array<{ id?: string; from?: string; type?: string; text?: { body?: string } }>;
+            statuses?: Array<{ id?: string; status?: 'sent' | 'delivered' | 'read' | 'failed'; recipient_id?: string }>;
           };
         }>;
       }>;
@@ -293,16 +296,80 @@ router.post('/webhooks/meta', async (req, res) => {
       if (entry.messaging) {
         const channel = payload.object === 'instagram' ? 'instagram' : 'facebook';
         for (const msgEvent of entry.messaging) {
+          // Handle delivery & read receipts from Meta
+          if (msgEvent.delivery || msgEvent.read) {
+            const senderId = msgEvent.sender?.id;
+            const recipientId = msgEvent.recipient?.id;
+            const candidateIds = Array.from(new Set([recipientId, entry.id].filter((v): v is string => Boolean(v))));
+            if (senderId && candidateIds.length > 0) {
+              const { data: matchingConvs } = await admin
+                .from('conversations')
+                .select('id, business_id')
+                .eq('channel', channel)
+                .eq('external_thread_id', senderId)
+                .in('channel_account_id', candidateIds);
+
+              for (const conv of matchingConvs || []) {
+                if (msgEvent.delivery?.mids?.length) {
+                  await admin
+                    .from('messages')
+                    .update({ delivery_status: 'delivered' })
+                    .eq('conversation_id', conv.id)
+                    .in('external_message_id', msgEvent.delivery.mids)
+                    .eq('delivery_status', 'sent');
+                } else if (msgEvent.delivery?.watermark) {
+                  await admin
+                    .from('messages')
+                    .update({ delivery_status: 'delivered' })
+                    .eq('conversation_id', conv.id)
+                    .in('sender_type', ['ai', 'staff'])
+                    .eq('delivery_status', 'sent')
+                    .lte('created_at', new Date(msgEvent.delivery.watermark).toISOString());
+                }
+
+                if (msgEvent.read?.watermark) {
+                  await admin
+                    .from('messages')
+                    .update({ delivery_status: 'read' })
+                    .eq('conversation_id', conv.id)
+                    .in('sender_type', ['ai', 'staff'])
+                    .in('delivery_status', ['sent', 'delivered'])
+                    .lte('created_at', new Date(msgEvent.read.watermark).toISOString());
+                }
+
+                broadcastToBusiness(conv.business_id, 'message:status', {
+                  conversationId: conv.id,
+                  status: msgEvent.read ? 'read' : 'delivered',
+                });
+              }
+            }
+            continue;
+          }
+
           if (msgEvent.message?.is_echo) continue;
 
-          const text =
-            msgEvent.message?.text?.trim() ||
-            msgEvent.postback?.title?.trim() ||
-            (msgEvent.message?.attachments?.length ? '[Attachment]' : '');
+          const incomingAtts = (msgEvent.message?.attachments || [])
+            .map((a) => {
+              const rawUrl = a.payload?.url || '';
+              if (!rawUrl.startsWith('https://') && !rawUrl.startsWith('http://')) return null;
+              const isImg = a.type === 'image';
+              return {
+                file_url: rawUrl,
+                file_type: isImg ? 'image' : a.type || 'file',
+                file_name: isImg ? 'Image attachment' : `${a.type || 'file'} attachment`,
+                file_size: 0,
+              };
+            })
+            .filter((v): v is { file_url: string; file_type: string; file_name: string; file_size: number } => Boolean(v));
+
+          const hasImageAtt = incomingAtts.some((a) => a.file_type === 'image');
+          const rawText = msgEvent.message?.text?.trim() || msgEvent.postback?.title?.trim() || '';
+          const previewSummary =
+            rawText || (hasImageAtt ? '📷 Photo' : incomingAtts.length > 0 ? '📎 Attachment' : '');
           const mid = msgEvent.message?.mid || msgEvent.postback?.mid || `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const senderId = msgEvent.sender?.id;
           const recipientId = msgEvent.recipient?.id;
-          if (!text || !senderId || (!recipientId && !entry.id)) continue;
+          if (!previewSummary || !senderId || (!recipientId && !entry.id)) continue;
 
           const candidateAccountIds = Array.from(new Set([recipientId, entry.id].filter((v): v is string => Boolean(v))));
           if (candidateAccountIds.includes(senderId)) continue;
@@ -372,7 +439,7 @@ router.post('/webhooks/meta', async (req, res) => {
             let senderName = `${channel.toUpperCase()} User ${senderId.slice(-4)}`;
             let senderAvatar = '';
 
-            if (!conv || !conv.customer_name || conv.customer_name.startsWith(`${channel.toUpperCase()} User `)) {
+            if (!conv || !conv.customer_avatar || !conv.customer_name || conv.customer_name.startsWith(`${channel.toUpperCase()} User `)) {
               const { token } = await resolveMetaChannelToken({
                 businessId: matchedBusinessId,
                 channel,
@@ -395,7 +462,7 @@ router.post('/webhooks/meta', async (req, res) => {
                   channel_account_id: matchedAccountId,
                   customer_name: senderName,
                   customer_avatar: senderAvatar,
-                  last_message: text,
+                  last_message: previewSummary,
                   last_message_at: new Date().toISOString(),
                   unread_count: 1,
                   ai_enabled: true,
@@ -412,7 +479,7 @@ router.post('/webhooks/meta', async (req, res) => {
                     : {}),
                   ...(senderAvatar ? { customer_avatar: senderAvatar } : {}),
                   channel_account_id: matchedAccountId || conv.channel_account_id,
-                  last_message: text,
+                  last_message: previewSummary,
                   last_message_at: new Date().toISOString(),
                   unread_count: (conv.unread_count || 0) + 1,
                 })
@@ -425,6 +492,7 @@ router.post('/webhooks/meta', async (req, res) => {
             if (conv) {
               broadcastToBusiness(matchedBusinessId, 'conversation:updated', conv);
 
+              const msgType = hasImageAtt ? 'image' : incomingAtts.length > 0 ? 'attachment' : 'text';
               const { data: savedMsg } = await admin
                 .from('messages')
                 .insert({
@@ -432,19 +500,37 @@ router.post('/webhooks/meta', async (req, res) => {
                   conversation_id: conv.id,
                   external_message_id: mid,
                   sender_type: 'customer',
-                  content: text,
-                  message_type: 'text',
+                  content: rawText,
+                  message_type: msgType,
                   delivery_status: 'delivered',
                 })
                 .select('*')
                 .single();
 
-              if (savedMsg) broadcastToBusiness(matchedBusinessId, 'message:new', savedMsg);
+              if (savedMsg) {
+                if (incomingAtts.length > 0) {
+                  await admin.from('message_attachments').insert(
+                    incomingAtts.map((a) => ({
+                      business_id: matchedBusinessId!,
+                      message_id: savedMsg.id,
+                      ...a,
+                    }))
+                  );
+                }
+                const { data: fullMsg } = await admin
+                  .from('messages')
+                  .select('*, attachments:message_attachments(*)')
+                  .eq('id', savedMsg.id)
+                  .single();
+                broadcastToBusiness(matchedBusinessId, 'message:new', fullMsg || savedMsg);
+              }
 
+              const aiInputText =
+                rawText || (hasImageAtt ? 'Customer sent an image.' : 'Customer sent a file attachment.');
               const aiOut = await processCustomerMessageWithAi({
                 businessId: matchedBusinessId,
                 conversationId: conv.id,
-                customerMessage: text,
+                customerMessage: aiInputText,
               });
 
               if (aiOut.replied && aiOut.replyText) {
@@ -455,6 +541,24 @@ router.post('/webhooks/meta', async (req, res) => {
                   recipientId: senderId,
                   text: aiOut.replyText,
                 });
+                if (aiOut.messageId) {
+                  if (dispatch.delivered && dispatch.externalMessageId) {
+                    await admin
+                      .from('messages')
+                      .update({ external_message_id: dispatch.externalMessageId })
+                      .eq('id', aiOut.messageId);
+                  } else if (!dispatch.delivered) {
+                    await admin
+                      .from('messages')
+                      .update({ delivery_status: 'failed' })
+                      .eq('id', aiOut.messageId);
+                    broadcastToBusiness(matchedBusinessId, 'message:status', {
+                      conversationId: conv.id,
+                      messageId: aiOut.messageId,
+                      status: 'failed',
+                    });
+                  }
+                }
                 if (!dispatch.delivered) {
                   await admin.from('social_connection_logs').insert({
                     business_id: matchedBusinessId,
@@ -485,7 +589,7 @@ router.post('/webhooks/meta', async (req, res) => {
         for (const change of entry.changes) {
           const val = change.value;
           const phoneId = val?.metadata?.phone_number_id;
-          if (!phoneId || !val?.messages) continue;
+          if (!phoneId) continue;
 
           const { data: waAcc } = await admin
             .from('whatsapp_accounts')
@@ -495,6 +599,28 @@ router.post('/webhooks/meta', async (req, res) => {
             .maybeSingle();
 
           if (!waAcc) continue;
+
+          if (val?.statuses?.length) {
+            for (const st of val.statuses) {
+              if (!st.id || !st.status) continue;
+              const { data: updated } = await admin
+                .from('messages')
+                .update({ delivery_status: st.status })
+                .eq('business_id', waAcc.business_id)
+                .eq('external_message_id', st.id)
+                .select('id, conversation_id')
+                .maybeSingle();
+              if (updated) {
+                broadcastToBusiness(waAcc.business_id, 'message:status', {
+                  conversationId: updated.conversation_id,
+                  messageId: updated.id,
+                  status: st.status,
+                });
+              }
+            }
+          }
+
+          if (!val?.messages) continue;
 
           for (const waMsg of val.messages) {
             const text = waMsg.text?.body?.trim() || (waMsg.type && waMsg.type !== 'text' ? `[${waMsg.type}]` : '');
@@ -583,6 +709,24 @@ router.post('/webhooks/meta', async (req, res) => {
                     recipientId: from,
                     text: aiOut.replyText,
                   });
+                  if (aiOut.messageId) {
+                    if (dispatch.delivered && dispatch.externalMessageId) {
+                      await admin
+                        .from('messages')
+                        .update({ external_message_id: dispatch.externalMessageId })
+                        .eq('id', aiOut.messageId);
+                    } else if (!dispatch.delivered) {
+                      await admin
+                        .from('messages')
+                        .update({ delivery_status: 'failed' })
+                        .eq('id', aiOut.messageId);
+                      broadcastToBusiness(waAcc.business_id, 'message:status', {
+                        conversationId: conv.id,
+                        messageId: aiOut.messageId,
+                        status: 'failed',
+                      });
+                    }
+                  }
                   if (!dispatch.delivered) {
                     await admin.from('social_connection_logs').insert({
                       business_id: waAcc.business_id,

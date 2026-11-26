@@ -2555,6 +2555,7 @@ ${params.customerMessage}`;
   }
   return {
     replied: true,
+    messageId: savedAiMsg?.id,
     replyText: parsed.reply_text,
     orderCreatedId
   };
@@ -3040,9 +3041,25 @@ async function sendMetaCapiEvent(params) {
     return { ok: false, error: msg };
   }
 }
+function sanitizeSafeHttpUrl(raw) {
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw.trim());
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.toString();
+    }
+  } catch {
+  }
+  return "";
+}
 async function dispatchChannelReply(params) {
   if (params.channel === "web_test") {
     return { delivered: true };
+  }
+  const cleanText = (params.text || "").trim();
+  const safeAttachmentUrl = sanitizeSafeHttpUrl(params.attachmentUrl);
+  if (!cleanText && !safeAttachmentUrl) {
+    return { delivered: false, error: "Message text or valid attachment URL is required." };
   }
   const metaCfg = await getPlatformMetaConfig();
   if (params.channel === "facebook" || params.channel === "instagram") {
@@ -3052,21 +3069,45 @@ async function dispatchChannelReply(params) {
       channelAccountId: params.channelAccountId
     });
     if (!token) return { delivered: false, error: "No active Meta Page/IG access token." };
-    const res = await fetch(
-      `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`,
-      {
+    const endpoint = `https://graph.facebook.com/${metaCfg.apiVersion}/me/messages?access_token=${encodeURIComponent(token)}`;
+    let lastMsgId;
+    if (safeAttachmentUrl) {
+      const attType = params.attachmentType === "file" ? "file" : "image";
+      const attRes = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messaging_type: "RESPONSE",
           recipient: { id: params.recipientId },
-          message: { text: params.text }
+          message: {
+            attachment: {
+              type: attType,
+              payload: { url: safeAttachmentUrl, is_reusable: true }
+            }
+          }
         })
+      });
+      const attJson = await attRes.json();
+      if (!attRes.ok) {
+        return { delivered: false, error: attJson.error?.message || `Meta attachment send error (${attRes.status})` };
       }
-    );
-    const json = await res.json();
-    if (!res.ok) return { delivered: false, error: json.error?.message || `Meta Send API error (${res.status})` };
-    return { delivered: true, externalMessageId: json.message_id };
+      lastMsgId = attJson.message_id;
+    }
+    if (cleanText) {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messaging_type: "RESPONSE",
+          recipient: { id: params.recipientId },
+          message: { text: cleanText }
+        })
+      });
+      const json = await res.json();
+      if (!res.ok) return { delivered: false, error: json.error?.message || `Meta Send API error (${res.status})` };
+      lastMsgId = json.message_id || lastMsgId;
+    }
+    return { delivered: true, externalMessageId: lastMsgId };
   }
   if (params.channel === "whatsapp") {
     const { token, accountId } = await resolveMetaChannelToken({
@@ -3076,18 +3117,29 @@ async function dispatchChannelReply(params) {
     });
     const phoneId = params.channelAccountId || accountId;
     if (!token || !phoneId) return { delivered: false, error: "No active WhatsApp Business token." };
+    const waPayload = safeAttachmentUrl ? params.attachmentType === "file" ? {
+      messaging_product: "whatsapp",
+      to: params.recipientId,
+      type: "document",
+      document: { link: safeAttachmentUrl, ...cleanText ? { caption: cleanText } : {} }
+    } : {
+      messaging_product: "whatsapp",
+      to: params.recipientId,
+      type: "image",
+      image: { link: safeAttachmentUrl, ...cleanText ? { caption: cleanText } : {} }
+    } : {
+      messaging_product: "whatsapp",
+      to: params.recipientId,
+      type: "text",
+      text: { body: cleanText }
+    };
     const res = await fetch(`https://graph.facebook.com/${metaCfg.apiVersion}/${phoneId}/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`
       },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to: params.recipientId,
-        type: "text",
-        text: { body: params.text }
-      })
+      body: JSON.stringify(waPayload)
     });
     const json = await res.json();
     if (!res.ok) return { delivered: false, error: json.error?.message || `WhatsApp Cloud API error (${res.status})` };
@@ -3135,7 +3187,7 @@ async function syncMetaConversationsForBusiness(businessId, options) {
       warnings.push(`${params.channel.toUpperCase()} (${params.pageName}) webhook: ${subRes.error}`);
     }
     const platformQuery = params.channel === "instagram" ? "&platform=instagram" : "";
-    const convUrl = `https://graph.facebook.com/${metaCfg.apiVersion}/${params.pageId}/conversations?fields=id,updated_time,participants,messages.limit(10){id,message,from,to,created_time}${platformQuery}&limit=15&access_token=${encodeURIComponent(params.token)}`;
+    const convUrl = `https://graph.facebook.com/${metaCfg.apiVersion}/${params.pageId}/conversations?fields=id,updated_time,participants,messages.limit(15){id,message,from,to,created_time,attachments}&${platformQuery ? platformQuery.slice(1) + "&" : ""}limit=15&access_token=${encodeURIComponent(params.token)}`;
     const res = await fetch(convUrl);
     const json = await res.json();
     if (!res.ok) {
@@ -3153,11 +3205,22 @@ async function syncMetaConversationsForBusiness(businessId, options) {
       );
       const customerId = customerParticipant?.id || firstCustomerMsg?.from?.id;
       if (!customerId) continue;
-      const customerName = customerParticipant?.name || firstCustomerMsg?.from?.name || `${params.channel.toUpperCase()} User ${customerId.slice(-4)}`;
+      let customerName = customerParticipant?.name || firstCustomerMsg?.from?.name || `${params.channel.toUpperCase()} User ${customerId.slice(-4)}`;
       const latestMsg = msgsChrono[msgsChrono.length - 1];
-      const latestText = latestMsg?.message || "";
+      const latestHasAttachments = Boolean(latestMsg?.attachments?.data?.length);
+      const latestText = latestMsg?.message?.trim() || (latestHasAttachments ? latestMsg?.attachments?.data?.[0]?.image_data ? "\u{1F4F7} Photo" : "\u{1F4CE} Attachment" : "");
       const latestAt = latestMsg?.created_time || thread.updated_time || (/* @__PURE__ */ new Date()).toISOString();
       let { data: conv } = await admin.from("conversations").select("*").eq("business_id", businessId).eq("channel", params.channel).eq("external_thread_id", customerId).maybeSingle();
+      let customerAvatar = conv?.customer_avatar || "";
+      if (!conv || !customerAvatar || customerName.startsWith(`${params.channel.toUpperCase()} User `)) {
+        const prof = await fetchMetaSenderProfile({
+          senderId: customerId,
+          accessToken: params.token,
+          apiVersion: metaCfg.apiVersion
+        });
+        if (prof.name) customerName = prof.name;
+        if (prof.avatar) customerAvatar = prof.avatar;
+      }
       if (!conv) {
         const { data: createdConv } = await admin.from("conversations").insert({
           business_id: businessId,
@@ -3165,6 +3228,7 @@ async function syncMetaConversationsForBusiness(businessId, options) {
           external_thread_id: customerId,
           channel_account_id: params.channelAccountId,
           customer_name: customerName,
+          customer_avatar: customerAvatar,
           last_message: latestText,
           last_message_at: latestAt,
           unread_count: 1,
@@ -3172,8 +3236,11 @@ async function syncMetaConversationsForBusiness(businessId, options) {
         }).select("*").single();
         conv = createdConv;
         if (conv) syncedConversations += 1;
-      } else if (customerName && !customerName.includes("User ") && conv.customer_name !== customerName) {
-        await admin.from("conversations").update({ customer_name: customerName }).eq("id", conv.id);
+      } else if (customerName && !customerName.includes("User ") && conv.customer_name !== customerName || customerAvatar && conv.customer_avatar !== customerAvatar) {
+        await admin.from("conversations").update({
+          ...customerName && !customerName.includes("User ") ? { customer_name: customerName } : {},
+          ...customerAvatar ? { customer_avatar: customerAvatar } : {}
+        }).eq("id", conv.id);
       }
       if (!conv) continue;
       const { data: existingMsgs } = await admin.from("messages").select("external_message_id").eq("conversation_id", conv.id).neq("external_message_id", "");
@@ -3182,26 +3249,51 @@ async function syncMetaConversationsForBusiness(businessId, options) {
       let newestUnansweredText = "";
       for (const m of msgsChrono) {
         if (!m.id || existingIds.has(m.id)) continue;
-        const text = (m.message || "").trim() || "[Attachment]";
+        const rawAtts = m.attachments?.data || [];
+        const parsedAtts = rawAtts.map((att) => {
+          const url = att.image_data?.url || att.image_data?.preview_url || att.file_url || att.video_data?.url || "";
+          const safeUrl = sanitizeSafeHttpUrl(url);
+          if (!safeUrl) return null;
+          const isImg = Boolean(att.image_data?.url || att.image_data?.preview_url || att.mime_type?.startsWith("image/"));
+          return {
+            file_url: safeUrl,
+            file_type: isImg ? "image" : "file",
+            file_name: att.name || "",
+            file_size: Number(att.size || 0)
+          };
+        }).filter((v) => Boolean(v));
+        const text = (m.message || "").trim() || (parsedAtts.length ? "" : "[Attachment]");
         const isPage = m.from?.id === params.pageId || m.from?.id === params.channelAccountId;
         const senderType = isPage ? "staff" : "customer";
+        const hasImg = parsedAtts.some((a) => a.file_type === "image");
+        const msgType = hasImg ? "image" : parsedAtts.length > 0 ? "attachment" : "text";
         const { data: saved } = await admin.from("messages").insert({
           business_id: businessId,
           conversation_id: conv.id,
           external_message_id: m.id,
           sender_type: senderType,
           content: text,
-          message_type: "text",
+          message_type: msgType,
           delivery_status: "delivered",
           created_at: m.created_time || (/* @__PURE__ */ new Date()).toISOString()
         }).select("*").single();
         if (saved) {
+          if (parsedAtts.length > 0) {
+            await admin.from("message_attachments").insert(
+              parsedAtts.map((a) => ({
+                business_id: businessId,
+                message_id: saved.id,
+                ...a
+              }))
+            );
+          }
+          const { data: fullSaved } = await admin.from("messages").select("*, attachments:message_attachments(*)").eq("id", saved.id).single();
           syncedMessages += 1;
           existingIds.add(m.id);
-          broadcastToBusiness(businessId, "message:new", saved);
+          broadcastToBusiness(businessId, "message:new", fullSaved || saved);
           if (senderType === "customer") {
             addedNewCustomerMsg = true;
-            newestUnansweredText = text;
+            newestUnansweredText = text || (hasImg ? "Customer sent an image." : "Customer sent an attachment.");
           } else {
             addedNewCustomerMsg = false;
             newestUnansweredText = "";
@@ -3225,6 +3317,13 @@ async function syncMetaConversationsForBusiness(businessId, options) {
             recipientId: customerId,
             text: aiOut.replyText
           });
+          if (aiOut.messageId) {
+            if (sent.delivered && sent.externalMessageId) {
+              await admin.from("messages").update({ external_message_id: sent.externalMessageId }).eq("id", aiOut.messageId);
+            } else if (!sent.delivered) {
+              await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOut.messageId);
+            }
+          }
           if (sent.delivered) {
             aiRepliesSent += 1;
           } else if (sent.error) {
@@ -3423,11 +3522,16 @@ router2.post("/businesses/:businessId/upload", requireAuth, requireBusinessAcces
     if (buffer.length > 8 * 1024 * 1024) {
       return res.status(400).json({ error: "File exceeds 8MB upload limit." });
     }
+    const blockedMimePrefixes = ["text/html", "application/javascript", "text/javascript", "image/svg+xml"];
+    const normalizedType = (contentType || "application/octet-stream").toLowerCase();
+    if (blockedMimePrefixes.some((b) => normalizedType.includes(b))) {
+      return res.status(400).json({ error: "Unsupported or unsafe file type." });
+    }
     const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
     const storagePath = `${req.businessId}/${Date.now()}_${safeName}`;
     const admin = getSupabaseAdmin();
     const { error } = await admin.storage.from(targetBucket).upload(storagePath, buffer, {
-      contentType: contentType || "application/octet-stream",
+      contentType: normalizedType,
       upsert: false
     });
     if (error) return res.status(400).json({ error: error.message });
@@ -4092,10 +4196,25 @@ router3.get("/businesses/:businessId/conversations/:conversationId/messages", re
     const admin = getSupabaseAdmin();
     const { data, error } = await admin.from("messages").select("*, attachments:message_attachments(*)").eq("conversation_id", req.params.conversationId).eq("business_id", req.businessId).order("created_at", { ascending: true });
     if (error) return res.status(400).json({ error: error.message });
-    await admin.from("conversations").update({ unread_count: 0 }).eq("id", req.params.conversationId).eq("business_id", req.businessId);
+    await Promise.all([
+      admin.from("conversations").update({ unread_count: 0 }).eq("id", req.params.conversationId).eq("business_id", req.businessId),
+      admin.from("messages").update({ delivery_status: "read" }).eq("conversation_id", req.params.conversationId).eq("business_id", req.businessId).eq("sender_type", "customer").neq("delivery_status", "read")
+    ]);
     return res.json({ messages: data || [] });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to load messages." });
+  }
+});
+router3.post("/businesses/:businessId/conversations/:conversationId/read", requireAuth, requireBusinessAccess("inbox"), async (req, res) => {
+  try {
+    const admin = getSupabaseAdmin();
+    await Promise.all([
+      admin.from("conversations").update({ unread_count: 0 }).eq("id", req.params.conversationId).eq("business_id", req.businessId),
+      admin.from("messages").update({ delivery_status: "read" }).eq("conversation_id", req.params.conversationId).eq("business_id", req.businessId).eq("sender_type", "customer").neq("delivery_status", "read")
+    ]);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to mark conversation read." });
   }
 });
 router3.patch("/businesses/:businessId/conversations/:conversationId", requireAuth, requireBusinessAccess("inbox"), async (req, res) => {
@@ -4129,7 +4248,19 @@ router3.post("/businesses/:businessId/conversations/:conversationId/reply", requ
     const admin = getSupabaseAdmin();
     const businessId = req.businessId;
     const conversationId = req.params.conversationId;
-    const { content, mode, attachmentUrl } = req.body;
+    const { content, mode, attachmentUrl, attachmentType, attachmentName, attachmentSize } = req.body;
+    let safeAttachmentUrl = "";
+    if (attachmentUrl) {
+      try {
+        const parsed = new URL(attachmentUrl.trim());
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          return res.status(400).json({ error: "Invalid attachment URL protocol." });
+        }
+        safeAttachmentUrl = parsed.toString();
+      } catch {
+        return res.status(400).json({ error: "Invalid attachment URL." });
+      }
+    }
     const { data: conv } = await admin.from("conversations").select("*").eq("id", conversationId).eq("business_id", businessId).maybeSingle();
     if (!conv) return res.status(404).json({ error: "Conversation not found." });
     if (mode === "ai") {
@@ -4146,7 +4277,7 @@ router3.post("/businesses/:businessId/conversations/:conversationId/reply", requ
           insufficientCoins: aiOutcome.insufficientCoins
         });
       }
-      let deliveryWarning;
+      let deliveryWarning2;
       let channelDelivered = true;
       if (conv.channel !== "web_test" && aiOutcome.replyText) {
         const dispatch = await dispatchChannelReply({
@@ -4157,56 +4288,83 @@ router3.post("/businesses/:businessId/conversations/:conversationId/reply", requ
           text: aiOutcome.replyText
         });
         channelDelivered = dispatch.delivered;
+        if (aiOutcome.messageId) {
+          if (dispatch.delivered && dispatch.externalMessageId) {
+            await admin.from("messages").update({ external_message_id: dispatch.externalMessageId }).eq("id", aiOutcome.messageId);
+          } else if (!dispatch.delivered) {
+            await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOutcome.messageId);
+            broadcastToBusiness(businessId, "message:status", {
+              conversationId,
+              messageId: aiOutcome.messageId,
+              status: "failed"
+            });
+          }
+        }
         if (!dispatch.delivered) {
-          deliveryWarning = dispatch.error || `Failed to send AI reply to ${conv.channel}.`;
+          deliveryWarning2 = dispatch.error || `Failed to send AI reply to ${conv.channel}.`;
         }
       }
-      return res.json({ ...aiOutcome, channelDelivered, deliveryWarning });
+      return res.json({ ...aiOutcome, channelDelivered, deliveryWarning: deliveryWarning2 });
     }
-    if (!content?.trim() && !attachmentUrl) {
-      return res.status(400).json({ error: "Message content is required." });
+    const cleanContent = content?.trim() || "";
+    if (!cleanContent && !safeAttachmentUrl) {
+      return res.status(400).json({ error: "Message content or attachment is required." });
     }
-    let deliveryStatus = "sent";
+    let deliveryStatus = conv.channel === "web_test" ? "delivered" : "sent";
     let externalMsgId = "";
-    if (conv.channel !== "web_test" && content?.trim()) {
+    let deliveryWarning;
+    const normalizedAttachmentType = attachmentType === "file" ? "file" : "image";
+    if (conv.channel !== "web_test") {
       const dispatch = await dispatchChannelReply({
         businessId,
         channel: conv.channel,
         channelAccountId: conv.channel_account_id || "",
         recipientId: conv.external_thread_id,
-        text: content.trim()
+        text: cleanContent,
+        attachmentUrl: safeAttachmentUrl || void 0,
+        attachmentType: safeAttachmentUrl ? normalizedAttachmentType : void 0
       });
       if (!dispatch.delivered) {
         deliveryStatus = "failed";
+        deliveryWarning = dispatch.error || `Failed to send to ${conv.channel}.`;
       } else if (dispatch.externalMessageId) {
         externalMsgId = dispatch.externalMessageId;
       }
     }
+    const msgType = safeAttachmentUrl ? normalizedAttachmentType === "file" ? "attachment" : "image" : "text";
     const { data: msg, error } = await admin.from("messages").insert({
       business_id: businessId,
       conversation_id: conversationId,
       external_message_id: externalMsgId,
       sender_type: "staff",
       sender_id: req.user.id,
-      content: content?.trim() || "",
-      message_type: attachmentUrl ? "image" : "text",
+      content: cleanContent,
+      message_type: msgType,
       delivery_status: deliveryStatus
     }).select("*").single();
     if (error) return res.status(400).json({ error: error.message });
-    if (attachmentUrl) {
+    if (safeAttachmentUrl) {
       await admin.from("message_attachments").insert({
         business_id: businessId,
         message_id: msg.id,
-        file_url: attachmentUrl,
-        file_type: "image"
+        file_url: safeAttachmentUrl,
+        file_type: normalizedAttachmentType,
+        file_name: (attachmentName || "").slice(0, 180),
+        file_size: Number(attachmentSize || 0)
       });
     }
-    await admin.from("conversations").update({
-      last_message: content?.trim() || "[Attachment]",
-      last_message_at: (/* @__PURE__ */ new Date()).toISOString()
-    }).eq("id", conversationId);
-    broadcastToBusiness(businessId, "message:new", msg);
-    return res.status(201).json({ message: msg });
+    const { data: fullMsg } = await admin.from("messages").select("*, attachments:message_attachments(*)").eq("id", msg.id).single();
+    const lastMsgSummary = cleanContent || (normalizedAttachmentType === "file" ? "\u{1F4CE} File attachment" : "\u{1F4F7} Photo");
+    const { data: updatedConv } = await admin.from("conversations").update({
+      last_message: lastMsgSummary,
+      last_message_at: (/* @__PURE__ */ new Date()).toISOString(),
+      unread_count: 0
+    }).eq("id", conversationId).select("*, customer:customers(*)").single();
+    if (updatedConv) {
+      broadcastToBusiness(businessId, "conversation:updated", updatedConv);
+    }
+    broadcastToBusiness(businessId, "message:new", fullMsg || msg);
+    return res.status(201).json({ message: fullMsg || msg, deliveryWarning });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to send reply." });
   }
@@ -4985,12 +5143,48 @@ router4.post("/webhooks/meta", async (req, res) => {
       if (entry.messaging) {
         const channel = payload.object === "instagram" ? "instagram" : "facebook";
         for (const msgEvent of entry.messaging) {
+          if (msgEvent.delivery || msgEvent.read) {
+            const senderId2 = msgEvent.sender?.id;
+            const recipientId2 = msgEvent.recipient?.id;
+            const candidateIds = Array.from(new Set([recipientId2, entry.id].filter((v) => Boolean(v))));
+            if (senderId2 && candidateIds.length > 0) {
+              const { data: matchingConvs } = await admin.from("conversations").select("id, business_id").eq("channel", channel).eq("external_thread_id", senderId2).in("channel_account_id", candidateIds);
+              for (const conv of matchingConvs || []) {
+                if (msgEvent.delivery?.mids?.length) {
+                  await admin.from("messages").update({ delivery_status: "delivered" }).eq("conversation_id", conv.id).in("external_message_id", msgEvent.delivery.mids).eq("delivery_status", "sent");
+                } else if (msgEvent.delivery?.watermark) {
+                  await admin.from("messages").update({ delivery_status: "delivered" }).eq("conversation_id", conv.id).in("sender_type", ["ai", "staff"]).eq("delivery_status", "sent").lte("created_at", new Date(msgEvent.delivery.watermark).toISOString());
+                }
+                if (msgEvent.read?.watermark) {
+                  await admin.from("messages").update({ delivery_status: "read" }).eq("conversation_id", conv.id).in("sender_type", ["ai", "staff"]).in("delivery_status", ["sent", "delivered"]).lte("created_at", new Date(msgEvent.read.watermark).toISOString());
+                }
+                broadcastToBusiness(conv.business_id, "message:status", {
+                  conversationId: conv.id,
+                  status: msgEvent.read ? "read" : "delivered"
+                });
+              }
+            }
+            continue;
+          }
           if (msgEvent.message?.is_echo) continue;
-          const text = msgEvent.message?.text?.trim() || msgEvent.postback?.title?.trim() || (msgEvent.message?.attachments?.length ? "[Attachment]" : "");
+          const incomingAtts = (msgEvent.message?.attachments || []).map((a) => {
+            const rawUrl = a.payload?.url || "";
+            if (!rawUrl.startsWith("https://") && !rawUrl.startsWith("http://")) return null;
+            const isImg = a.type === "image";
+            return {
+              file_url: rawUrl,
+              file_type: isImg ? "image" : a.type || "file",
+              file_name: isImg ? "Image attachment" : `${a.type || "file"} attachment`,
+              file_size: 0
+            };
+          }).filter((v) => Boolean(v));
+          const hasImageAtt = incomingAtts.some((a) => a.file_type === "image");
+          const rawText = msgEvent.message?.text?.trim() || msgEvent.postback?.title?.trim() || "";
+          const previewSummary = rawText || (hasImageAtt ? "\u{1F4F7} Photo" : incomingAtts.length > 0 ? "\u{1F4CE} Attachment" : "");
           const mid = msgEvent.message?.mid || msgEvent.postback?.mid || `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const senderId = msgEvent.sender?.id;
           const recipientId = msgEvent.recipient?.id;
-          if (!text || !senderId || !recipientId && !entry.id) continue;
+          if (!previewSummary || !senderId || !recipientId && !entry.id) continue;
           const candidateAccountIds = Array.from(new Set([recipientId, entry.id].filter((v) => Boolean(v))));
           if (candidateAccountIds.includes(senderId)) continue;
           let matchedBusinessId = null;
@@ -5024,7 +5218,7 @@ router4.post("/webhooks/meta", async (req, res) => {
             let { data: conv } = await admin.from("conversations").select("*").eq("business_id", matchedBusinessId).eq("channel", channel).eq("external_thread_id", senderId).maybeSingle();
             let senderName = `${channel.toUpperCase()} User ${senderId.slice(-4)}`;
             let senderAvatar = "";
-            if (!conv || !conv.customer_name || conv.customer_name.startsWith(`${channel.toUpperCase()} User `)) {
+            if (!conv || !conv.customer_avatar || !conv.customer_name || conv.customer_name.startsWith(`${channel.toUpperCase()} User `)) {
               const { token } = await resolveMetaChannelToken({
                 businessId: matchedBusinessId,
                 channel,
@@ -5044,7 +5238,7 @@ router4.post("/webhooks/meta", async (req, res) => {
                 channel_account_id: matchedAccountId,
                 customer_name: senderName,
                 customer_avatar: senderAvatar,
-                last_message: text,
+                last_message: previewSummary,
                 last_message_at: (/* @__PURE__ */ new Date()).toISOString(),
                 unread_count: 1,
                 ai_enabled: true
@@ -5055,7 +5249,7 @@ router4.post("/webhooks/meta", async (req, res) => {
                 ...senderName && conv.customer_name.startsWith(`${channel.toUpperCase()} User `) ? { customer_name: senderName } : {},
                 ...senderAvatar ? { customer_avatar: senderAvatar } : {},
                 channel_account_id: matchedAccountId || conv.channel_account_id,
-                last_message: text,
+                last_message: previewSummary,
                 last_message_at: (/* @__PURE__ */ new Date()).toISOString(),
                 unread_count: (conv.unread_count || 0) + 1
               }).eq("id", conv.id).select("*").single();
@@ -5063,20 +5257,34 @@ router4.post("/webhooks/meta", async (req, res) => {
             }
             if (conv) {
               broadcastToBusiness(matchedBusinessId, "conversation:updated", conv);
+              const msgType = hasImageAtt ? "image" : incomingAtts.length > 0 ? "attachment" : "text";
               const { data: savedMsg } = await admin.from("messages").insert({
                 business_id: matchedBusinessId,
                 conversation_id: conv.id,
                 external_message_id: mid,
                 sender_type: "customer",
-                content: text,
-                message_type: "text",
+                content: rawText,
+                message_type: msgType,
                 delivery_status: "delivered"
               }).select("*").single();
-              if (savedMsg) broadcastToBusiness(matchedBusinessId, "message:new", savedMsg);
+              if (savedMsg) {
+                if (incomingAtts.length > 0) {
+                  await admin.from("message_attachments").insert(
+                    incomingAtts.map((a) => ({
+                      business_id: matchedBusinessId,
+                      message_id: savedMsg.id,
+                      ...a
+                    }))
+                  );
+                }
+                const { data: fullMsg } = await admin.from("messages").select("*, attachments:message_attachments(*)").eq("id", savedMsg.id).single();
+                broadcastToBusiness(matchedBusinessId, "message:new", fullMsg || savedMsg);
+              }
+              const aiInputText = rawText || (hasImageAtt ? "Customer sent an image." : "Customer sent a file attachment.");
               const aiOut = await processCustomerMessageWithAi({
                 businessId: matchedBusinessId,
                 conversationId: conv.id,
-                customerMessage: text
+                customerMessage: aiInputText
               });
               if (aiOut.replied && aiOut.replyText) {
                 const dispatch = await dispatchChannelReply({
@@ -5086,6 +5294,18 @@ router4.post("/webhooks/meta", async (req, res) => {
                   recipientId: senderId,
                   text: aiOut.replyText
                 });
+                if (aiOut.messageId) {
+                  if (dispatch.delivered && dispatch.externalMessageId) {
+                    await admin.from("messages").update({ external_message_id: dispatch.externalMessageId }).eq("id", aiOut.messageId);
+                  } else if (!dispatch.delivered) {
+                    await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOut.messageId);
+                    broadcastToBusiness(matchedBusinessId, "message:status", {
+                      conversationId: conv.id,
+                      messageId: aiOut.messageId,
+                      status: "failed"
+                    });
+                  }
+                }
                 if (!dispatch.delivered) {
                   await admin.from("social_connection_logs").insert({
                     business_id: matchedBusinessId,
@@ -5114,9 +5334,23 @@ router4.post("/webhooks/meta", async (req, res) => {
         for (const change of entry.changes) {
           const val = change.value;
           const phoneId = val?.metadata?.phone_number_id;
-          if (!phoneId || !val?.messages) continue;
+          if (!phoneId) continue;
           const { data: waAcc } = await admin.from("whatsapp_accounts").select("business_id").eq("phone_number_id", phoneId).eq("is_active", true).maybeSingle();
           if (!waAcc) continue;
+          if (val?.statuses?.length) {
+            for (const st of val.statuses) {
+              if (!st.id || !st.status) continue;
+              const { data: updated } = await admin.from("messages").update({ delivery_status: st.status }).eq("business_id", waAcc.business_id).eq("external_message_id", st.id).select("id, conversation_id").maybeSingle();
+              if (updated) {
+                broadcastToBusiness(waAcc.business_id, "message:status", {
+                  conversationId: updated.conversation_id,
+                  messageId: updated.id,
+                  status: st.status
+                });
+              }
+            }
+          }
+          if (!val?.messages) continue;
           for (const waMsg of val.messages) {
             const text = waMsg.text?.body?.trim() || (waMsg.type && waMsg.type !== "text" ? `[${waMsg.type}]` : "");
             const mid = waMsg.id;
@@ -5178,6 +5412,18 @@ router4.post("/webhooks/meta", async (req, res) => {
                     recipientId: from,
                     text: aiOut.replyText
                   });
+                  if (aiOut.messageId) {
+                    if (dispatch.delivered && dispatch.externalMessageId) {
+                      await admin.from("messages").update({ external_message_id: dispatch.externalMessageId }).eq("id", aiOut.messageId);
+                    } else if (!dispatch.delivered) {
+                      await admin.from("messages").update({ delivery_status: "failed" }).eq("id", aiOut.messageId);
+                      broadcastToBusiness(waAcc.business_id, "message:status", {
+                        conversationId: conv.id,
+                        messageId: aiOut.messageId,
+                        status: "failed"
+                      });
+                    }
+                  }
                   if (!dispatch.delivered) {
                     await admin.from("social_connection_logs").insert({
                       business_id: waAcc.business_id,
